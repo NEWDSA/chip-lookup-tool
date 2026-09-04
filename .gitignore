@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# PyInstaller
+build/ChipLookup/
+build/Analysis-00.toc
+build/PYZ-00.toc
+build/PKG-00.toc
+build/EXE-00.toc
+build/warn-ChipLookup.txt
+build/xref-ChipLookup.html
+
+# PyInstaller 产物（dist/ChipLookup.exe 保留在外；dist/data 是 exe 自动生成的种子层）
+dist/screenshot_test.png
+dist/*.log
+
+# 开发产物
+*.bak
+*.swp
+.vscode/
+.idea/

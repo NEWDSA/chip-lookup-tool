@@ -1,0 +1,167 @@
+# -*- coding: utf-8 -*-
+"""
+src/fdnext/postprocess_data.py
+-------------------------------
+官方 createDefaultIdentifierPostprocessor 的内嵌常量表 —— 程序化提取自
+@itxtech/fdnext-core@3.2.0 dist/engine-DcIwql9n.js（对应 engine 86）。
+
+字段与值语义见 src/fdnext/postprocess.py。
+"""
+
+# micron/intel/spectek：Flash ID 前缀 -> die codename（最长前缀优先）
+PREFIX_DIE_CODENAME_MICRON = [
+    (1, 'C30832EA30', 'B47R'),
+    (1, 'D38932EA30', 'B47R'),
+    (1, 'E38A32EA30', 'B47R'),
+    (1, 'C30832EA34', 'B47T'),
+    (1, 'D38932EA34', 'B47T'),
+    (1, 'E38A32EA34', 'B47T'),
+    (1, 'D30C32EA30', 'N48R'),
+    (1, 'E38D32EA30', 'N48R'),
+    (1, 'F38E32EA30', 'N48R'),
+    (1, 'C30832E630', 'B57T'),
+    (1, 'D38932E630', 'B57T'),
+    (1, 'E38A32E630', 'B57T'),
+    (1, 'D30832E830', 'B58R'),
+    (1, 'E38932E830', 'B58R'),
+    (1, 'F38A32E830', 'B58R'),
+    (1, 'D30832E831', 'B58R'),
+    (1, 'E38932E831', 'B58R'),
+    (1, 'F38A32E831', 'B58R'),
+    (1, 'D30C42EE30', 'N58R'),
+    (1, 'E38D42EE30', 'N58R'),
+    (1, 'F38E42EE30', 'N58R'),
+    (1, 'D30C42EE31', 'N58R'),
+    (1, 'E38D42EE31', 'N58R'),
+    (1, 'F38E42EE31', 'N58R'),
+    (1, 'D30832E834', 'B68S'),
+    (1, 'E38932E834', 'B68S'),
+    (1, 'F38A32E834', 'B68S'),
+    (1, 'D30832E835', 'B68S'),
+    (1, 'E38932E835', 'B68S'),
+    (1, 'F38A32E835', 'B68S'),
+    (1, 'D5943E74', 'L52A'),
+    (1, 'D7D53E78', 'L52A'),
+    (1, '48002689', 'M62A'),
+    (1, '6801A689', 'M62A'),
+    (1, '68044689', 'L63B'),
+    (1, '8805C689', 'L63B'),
+    (1, '680446A9', 'L63B'),
+    (1, '680027A9', 'M73A'),
+    (1, '8801A7A9', 'M73A'),
+    (1, '682027A9', 'M73A'),
+    (1, '68044AA9', 'L73A'),
+    (1, '8805CAA9', 'L73A'),
+    (1, '88044BA900', 'L74A'),
+    (1, 'A805CBA900', 'L74A'),
+    (1, '88244BA900', 'L74A'),
+    (1, '88244BA984', 'L84A'),
+    (1, '64444BA9', 'L84A'),
+    (1, '84C54BA9', 'L84A'),
+    (1, '64643CA1', 'L84C'),
+    (1, '64643CA5', 'L84C'),
+    (1, '84E53CA5', 'L84C'),
+    (1, '84643CA5', 'L85A'),
+    (1, 'A4E53CA5', 'L85A'),
+    (1, '84643CA9', 'L85C'),
+    (1, 'A4E53CA9', 'L85C'),
+    (1, '846454A9', 'L95B'),
+    (1, 'A4E554A9', 'L95B'),
+    (1, '6808568A', 'B63A'),
+    (1, '88085FA9', 'B74A'),
+    (1, '88085F89', 'B74A'),
+    (1, '88285FA9', 'B74A'),
+    (1, 'A809DF89', 'B74A'),
+    (1, 'A809DFA9', 'B74A'),
+    (1, '847863A9', 'B85T'),
+    (1, '84787BA9', 'B85T'),
+    (1, 'A4F963A9', 'B85T'),
+    (1, 'A4F97BA9', 'B85T'),
+    (1, '844863A9', 'B95A'),
+    (1, '644432A5', 'L04A'),
+    (1, '844434AA', 'L05B'),
+    (1, '845832A1', 'B05A'),
+    (1, 'A46434AA', 'L05A'),
+    (1, 'A4E4348A', 'L06A'),
+    (1, 'A46432AA', 'L06B'),
+    (1, 'C4E532AA', 'L06B'),
+    (1, 'B47832AA', 'B0KB'),
+    (1, 'CCF932AA', 'B0KB'),
+    (1, 'A40832A1', 'B16A'),
+    (1, 'A48832A1', 'B16A'),
+    (1, 'C48932A1', 'B16A'),
+    (1, 'C40832A6', 'B17A'),
+    (1, 'D48932A6', 'B17A'),
+    (1, 'E48A32A6', 'B17A'),
+    (1, 'D40C32AA', 'N18A'),
+    (1, 'C41832A2', 'B27A'),
+    (1, 'D49932A2', 'B27A'),
+    (1, 'E49A32A2', 'B27A'),
+    (1, 'C30832E600', 'B27B'),
+    (1, 'D38932E6', 'B27B'),
+    (1, 'E38A32E6', 'B27B'),
+    (1, 'D31C32C6', 'N28A'),
+    (1, 'D39C32C6', 'N28A'),
+    (1, 'E39D32C6', 'N28A'),
+    (1, 'F39E32C6', 'N28A'),
+    (1, 'A36032C6', 'M26A'),
+    (1, 'A37832E5', 'B36R'),
+    (1, 'C37832EA', 'B37R'),
+    (0, '89D3AC32C6', 'N38A'),
+    (0, '89E3AD32C6', 'N38A'),
+    (0, '89D3AC32C2', 'N38B'),
+    (0, '89E3AD32C2', 'N38B'),
+    (0, '89092832C2', 'N4PA'),
+    (0, '89092932C2', 'N4PA'),
+    (0, '89092A32C2', 'N4PA'),
+    (0, '89092B32C2', 'N4PA'),
+    (0, '89050432C2', 'N4PA'),
+    (0, '89050532C2', 'N4PA'),
+    (0, '89050632C2', 'N4PA'),
+    (0, '89050732C2', 'N4PA'),
+]
+
+# ymtc：Flash ID 前缀 -> die codename
+PREFIX_DIE_CODENAME_YMTC = [
+    (1, 'C3482510', 'JGS'),
+    (1, 'C4492510', 'JGS'),
+    (1, 'C54A2510', 'JGS'),
+    (1, 'C3182510', 'JGS'),
+    (1, 'D5588D20', 'HUS'),
+    (1, 'C4284920', 'TAS'),
+    (1, 'C5294920', 'TAS'),
+    (1, 'C62A4920', 'TAS'),
+    (1, 'C4284930', 'WYS'),
+    (1, 'C5294930', 'WYS'),
+    (1, 'C4284940', 'WYS'),
+    (1, 'C5587130', 'WDS'),
+    (1, 'C6597130', 'WDS'),
+    (1, 'C55C5530', 'EMS'),
+    (1, 'C65D5530', 'EMS'),
+    (1, 'C4285540', 'WTS'),
+    (1, 'C4585540', 'WTS'),
+    (1, 'C5595540', 'WTS'),
+    (1, 'C5587540', 'SQS'),
+    (1, 'C5587940', 'SQS'),
+    (1, 'C6597540', 'SQS'),
+    (1, 'C6597940', 'SQS'),
+    (1, 'C65C9540', 'PTS'),
+    (1, 'C65D9540', 'PTS'),
+    (1, 'C65C9940', 'PTS'),
+    (1, 'C75D9940', 'PTS'),
+]
+
+# skhynix：byte6 命中时按 die_count 推导 density
+SKHYNIX_BYTE6_DIESTACK = [112, 128, 144, 160, 162, 176, 178, 192, 194, 208]
+
+# skhynix：整 ID 命中时强制 HYV9Q 规格
+SKHYNIX_SPECIAL_IDS = ['AD780C5B30E0', 'AD780D5B30E0', 'AD780E5B30E0']
+
+# 公共删除清单（samsung QLC / micron prefix / ymtc / skhynix 特殊项共用）
+REMOVE_PUBLIC = ['process_alias', 'generation_info', 'layer_count', 'cell_level', 'die_density', 'plane_count', 'speed_grade', 'page_size', 'redundant_area_size', 'pages_per_block']
+
+# skhynix byte6>=0x80 时删除的扩展字段
+REMOVE_SKHYNIX_EXT = ['block_size', 'blocks_per_lun', 'pages_per_block', 'simultaneously_programmed_pages', 'redundant_area_size', 'timing_mode_async', 'edo', 'interleave', 'cache', 'ecc_level', 'revision', 'enterprise', 'interface_type']
+
+# samsung QLC：die_codename 归一映射
+QLC_SAMSUNG_DIE = {'SSV4': 'SSV4Q', 'SSV5': 'SSV5Q', 'SSV6': 'SSV6Q', 'SSV7': 'SSV7Q', 'SSV8': 'SSV8Q', 'SSV9': 'SSV9Q', 'SSV9HS': 'SSV9HSQ'}

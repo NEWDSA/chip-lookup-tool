@@ -1,0 +1,11 @@
+# ChipLookup 仅依赖 Python 标准库（tkinter, sqlite3, csv, json, difflib）
+# 下面两项仅为可选 / 调试用：
+#   pillow：仅 src/ui.py 的 --screenshot 截图调试功能需要
+#   pyinstaller：打包成单文件 exe 用，可选
+
+# 调试截图功能
+pillow>=10.0.0
+
+# 打 exe 用（按需安装）
+; pyinstaller>=5.13.2 ; < 6.0    ; 用于 Win7 兼容版本
+; pyinstaller>=6.0              ; 用于 Win10+/Win11 当前版本

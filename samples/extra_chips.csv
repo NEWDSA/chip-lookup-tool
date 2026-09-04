@@ -1,0 +1,5 @@
+﻿part_number,model,manufacturer,type,capacity,bit_width,voltage,speed,package,dimensions,die_count,cs_count,die_revision,op_temp,notes
+SRV32-A1,MT60B4G8RZ-56B:D-ECC,Micron,DDR5,32Gb,x8,1.1V VDD,DDR5-5600B CL46,VFBGA-78,7.5x11x0.9,2,1,Rev D,商用,服务器 32Gb 颗粒（带 ECC 测试）
+SRV32-A2,K4ZAF325BM-MC16-ECC,Samsung,DDR5,32Gb,x8,1.1V VDD,DDR5-5600B CL46,FBGA-78,7.5x11x0.9,2,1,,商用,服务器 32Gb 颗粒（Samsung）
+SRV16-B1,H58G56AK6A025,SK Hynix,DDR5,16Gb,x8,1.1V VDD,DDR5-5600B CL46,FBGA-78,7.5x11x0.9,1,1,,商用,RDIMM 通用 16Gb 颗粒
+SRV-DDR4,MT40A2G16SA-062E,Micron,DDR4,16Gb,x16,1.2V VDD,DDR4-3200 CL22,VFBGA-96,7.5x13x1.0,1,2,Rev E,商用,旧服务器 DDR4 备件
