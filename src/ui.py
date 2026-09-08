@@ -25,8 +25,9 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from typing import Callable, List, Optional, Tuple
 
-from database import ChipDatabase
+from config import MODE_LABELS, MODE_UPSTREAM, Settings
 from search import lookup_exact, search, suggest_terms
+from sources import RecordSource, SourceLoadError, SourceUnsupportedError, make_source
 
 
 # ---------------- 配色（深色卡片风，参考 itxtech.fm）----------------
@@ -319,16 +320,18 @@ class SlimVScrollbar(tk.Canvas):
 # ---------------- 主窗口 ----------------
 
 class App(tk.Tk):
-    def __init__(self, db: ChipDatabase, on_change: Optional[Callable[[], None]] = None):
+    def __init__(self, settings: Settings, source: RecordSource,
+                 on_change: Optional[Callable[[], None]] = None):
         super().__init__()
         self.title("ChipLookup · 芯片料号查询器")
         self.geometry("1200x860")
         self.minsize(1000, 680)
         self.configure(bg=COLOR_BG)
 
-        self.db = db
+        self.settings = settings
+        self.source = source
         self.on_change = on_change
-        self._records_cache = self.db.list_records()
+        self._records_cache = self.source.list_records()
         self._candidates: List[Tuple[dict, float, str]] = []
         self._selected_index: int = -1  # 候选列表中选中项（全局索引，与 tree iid 一致）
 
@@ -352,7 +355,8 @@ class App(tk.Tk):
         self._build_layout()
         self._refresh_status()
         self._bind_global_keys()
-        self._refresh_mode_buttons()  # 初始化分段按钮高亮
+        self._refresh_mode_buttons()  # 初始化分页分段按钮高亮
+        self._refresh_source_buttons()  # 初始化数据源 radio 选中态（回填已保存模式）
         # 窗口首帧布局稳定后，按内容高度决定详情滚动条是否出现
         self._schedule_scroll_sync()
 
@@ -449,6 +453,32 @@ class App(tk.Tk):
         )
         style.map("ModeSelActive.TButton", background=[("active", "#0fa970")])
 
+        # 数据源模式 radio 单选组（indicatoron=False 成紧凑分段样式；互斥由共享变量保证）
+        style.configure(
+            "ModeRadio.TRadiobutton",
+            background=COLOR_BORDER,
+            foreground=COLOR_TEXT,
+            borderwidth=0,
+            focusthickness=0,
+            padding=(10, 5),
+            font=("Microsoft YaHei UI", 9),
+            indicatoron=False,
+            focuscolor="",          # 去掉 clam 主题自带的焦点虚框
+        )
+        style.map(
+            "ModeRadio.TRadiobutton",
+            background=[("selected", COLOR_ACCENT), ("active", "#3a4d63")],
+            foreground=[("selected", "#0e1620"), ("active", COLOR_TEXT)],
+        )
+        # 彻底移除 Radiobutton 的 focus 内边距/边框元素，消除选中时的虚线外框
+        style.layout("ModeRadio.TRadiobutton", [
+            ("Radiobutton.button", {"sticky": "nswe", "children": [
+                ("Radiobutton.padding", {"sticky": "nswe", "children": [
+                    ("Radiobutton.label", {"sticky": "nswe"}),
+                ]}),
+            ]}),
+        ])
+
         # 列表
         style.configure(
             "Candidate.Treeview",
@@ -485,6 +515,13 @@ class App(tk.Tk):
             foreground=COLOR_TEXT,
             font=("Microsoft YaHei UI", 11, "bold"),
         )
+        # 空值占位符样式（网络模式下上游不提供规格字段时显示「—」）
+        style.configure(
+            "DimValue.TLabel",
+            background=COLOR_CARD,
+            foreground=COLOR_TEXT_DIM,
+            font=("Microsoft YaHei UI", 11),
+        )
 
     # ---------------- 布局 ----------------
 
@@ -495,6 +532,23 @@ class App(tk.Tk):
         ttk.Label(top, text="ChipLookup", style="Title.TLabel").pack(side=tk.LEFT)
         self.status_label = ttk.Label(top, text="", style="Status.TLabel")
         self.status_label.pack(side=tk.LEFT, padx=(24, 0))
+
+        # 数据源模式选择（radio 单选组：本地CSV / 网络 / 混合）
+        # 互斥由共享变量 var_source_mode 自动保证，仅能选中一项；切换后写回配置文件
+        mode_box = ttk.Frame(top, style="Panel.TFrame")
+        mode_box.pack(side=tk.RIGHT)
+        ttk.Label(mode_box, text="数据源模式：", style="Status.TLabel").pack(side=tk.LEFT, padx=(0, 6))
+        self.var_source_mode = tk.StringVar(value=self.settings.mode)
+        for key in ("local", "upstream", "hybrid"):
+            rb = ttk.Radiobutton(
+                mode_box,
+                text=MODE_LABELS[key],
+                value=key,
+                variable=self.var_source_mode,
+                style="ModeRadio.TRadiobutton",
+                command=self._on_source_radio,
+            )
+            rb.pack(side=tk.LEFT, padx=(0, 2))
 
         # 主体（左右两栏 + 可拖分隔条）
         body = ttk.Frame(self, style="TFrame", padding=(14, 0))
@@ -782,10 +836,50 @@ class App(tk.Tk):
         self.bind("<F5>", lambda e: self._reload_db())
 
     def _refresh_status(self):
+        mode_label = MODE_LABELS.get(self.settings.mode, self.settings.mode)
         self.status_label.configure(
-            text=f"数据源：{os.path.basename(self.db.csv_path)}"
-                 f"   •   共 {self.db.count()} 条记录"
+            text=f"模式 {mode_label} · {self.source.describe()}"
+                 f"   •   共 {self.source.count()} 条记录"
         )
+
+    def _refresh_source_buttons(self):
+        """把 radio 组件选中项同步到当前模式（互斥由共享变量自动保证）。"""
+        if self.var_source_mode.get() != self.settings.mode:
+            self.var_source_mode.set(self.settings.mode)
+
+    def _on_source_radio(self):
+        """radio 单选回调：用户选中哪个单选项就切换哪个数据源。"""
+        self._set_source_mode(self.var_source_mode.get())
+
+    def _set_source_mode(self, mode: str):
+        """切换数据源模式：重建数据源、刷新候选/状态，并把模式写回配置文件。"""
+        if mode == self.settings.mode:
+            return
+        previous = self.settings.mode
+        self.settings.mode = mode
+        try:
+            new_source = make_source(self.settings)
+        except SourceLoadError as exc:
+            self.settings.mode = previous
+            self._refresh_source_buttons()  # 回滚 radio 选中项
+            messagebox.showerror(
+                "切换模式失败", f"无法载入「{MODE_LABELS.get(mode, mode)}」数据源：\n{exc}"
+            )
+            return
+        self.source = new_source
+        self._records_cache = self.source.list_records()
+        # 持久化模式选择（配置文件下次启动生效）
+        try:
+            self.settings.save()
+        except OSError as exc:
+            self._toast(f"模式已切换，但配置保存失败：{exc}")
+        self._refresh_status()
+        self._refresh_source_buttons()
+        if self.var_query.get().strip():
+            self._run_query()
+        else:
+            self._clear_detail()
+            self._render_detail_empty()
 
     def _on_query_change(self):
         """输入即响应：边输入边实时给候选列表。"""
@@ -1448,13 +1542,17 @@ class App(tk.Tk):
                       style="Card.TLabel",
                       font=("Microsoft YaHei UI", 11, "bold")).pack(anchor="w", pady=(0, 10))
             for label, value in rows:
-                if value in ("", None):
-                    continue
+                display = str(value) if value not in ("", None) else "\u2014"  # 空值显示占位符「—」
+                is_empty = value in ("", None)
                 row = ttk.Frame(card, style="Card.TFrame")
                 row.pack(fill=tk.X, pady=2)
                 lab = ttk.Label(row, text=label, style="Field.TLabel", width=22, anchor="w")
                 lab.pack(side=tk.LEFT)
-                val = ttk.Label(row, text=str(value), style="Value.TLabel", anchor="w", justify="left")
+                val = ttk.Label(
+                    row, text=display,
+                    style="DimValue.TLabel" if is_empty else "Value.TLabel",
+                    anchor="w", justify="left",
+                )
                 val.pack(side=tk.LEFT, fill=tk.X, expand=True)
                 # 记录字段值，随窗口缩放自适应换行（详情区宽度变化时统一刷新）
                 self._detail_value_labels.append((val, lab))
@@ -1512,6 +1610,9 @@ class App(tk.Tk):
     # ---------------- 数据导入导出 ----------------
 
     def _import_csv(self):
+        if not self.source.supports_import():
+            self._toast("当前模式（%s）不支持导入 CSV" % self.source.LABEL)
+            return
         path = filedialog.askopenfilename(
             title="导入 CSV（合并到现有库）",
             filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")],
@@ -1519,13 +1620,12 @@ class App(tk.Tk):
         if not path:
             return
         try:
-            n = self.db.import_csv(path, replace=False)
-            self.db.save()
+            n = self.source.import_csv(path, replace=False)
         except Exception as exc:
             messagebox.showerror("导入失败", str(exc))
             return
         # 重新加载缓存
-        self._records_cache = self.db.list_records()
+        self._records_cache = self.source.list_records()
         self._refresh_status()
         self._toast(f"导入 {n} 条")
         if self.var_query.get().strip():
@@ -1534,6 +1634,9 @@ class App(tk.Tk):
             self.on_change()
 
     def _export_csv(self):
+        if not self.source.supports_export():
+            self._toast("当前模式（%s）不支持导出 CSV" % self.source.LABEL)
+            return
         path = filedialog.asksaveasfilename(
             title="导出 CSV",
             defaultextension=".csv",
@@ -1543,7 +1646,7 @@ class App(tk.Tk):
         if not path:
             return
         try:
-            n = self.db.export_csv(path)
+            n = self.source.export_csv(path)
         except Exception as exc:
             messagebox.showerror("导出失败", str(exc))
             return
@@ -1551,27 +1654,29 @@ class App(tk.Tk):
 
     def _reload_db(self):
         try:
-            self.db.reload()
-        except Exception as exc:
+            self.source.reload()
+        except SourceLoadError as exc:
             messagebox.showerror("刷新失败", str(exc))
             return
-        self._records_cache = self.db.list_records()
+        self._records_cache = self.source.list_records()
         self._refresh_status()
-        self._toast("已从磁盘刷新")
+        self._toast("已从磁盘/缓存刷新")
         if self.var_query.get().strip():
             self._run_query()
         if self.on_change:
             self.on_change()
 
 
-def run(db: ChipDatabase, screenshot_to: Optional[str] = None, screenshot_query: Optional[str] = None,
+def run(settings: Settings, source: RecordSource,
+        screenshot_to: Optional[str] = None, screenshot_query: Optional[str] = None,
         screenshot_delay_ms: int = 0, screenshot_mode: Optional[str] = None):
     """供 main.py 调用的启动入口。
 
+    settings / source：运行配置与已构建好的数据源（由 main 负责按模式构建）。
     screenshot_to / screenshot_query 非空时，启动 UI、跑一次查询、再截图保存到该路径后退出。
     screenshot_mode: "paginate" 或 "load_more"，None 则保持默认
     """
-    app = App(db)
+    app = App(settings, source)
     if screenshot_mode:
         try:
             app.page_mode.set(screenshot_mode)
@@ -1767,9 +1872,9 @@ def run(db: ChipDatabase, screenshot_to: Optional[str] = None, screenshot_query:
             finally:
                 app.after(200, app.destroy)
 
-        if getattr(db, "_screenshot_mode", None) == "stitch":
+        if getattr(source, "_screenshot_mode", None) == "stitch":
             app.after(screenshot_delay_ms or 800, _after_stitch)
-        elif getattr(db, "_screenshot_mode", None) == "bottom":
+        elif getattr(source, "_screenshot_mode", None) == "bottom":
             app.after(screenshot_delay_ms or 800, _after_bottom)
         else:
             app.after(screenshot_delay_ms or 800, _after)

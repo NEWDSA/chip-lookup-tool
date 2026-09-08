@@ -6,6 +6,11 @@ chip_lookup.main
     python src/main.py
 也可被 src/ 当包运行：
     python -m chip_lookup (假设已 PYTHONPATH=src)
+
+支持三种运行模式（--mode / chiplookup.json 配置）：
+    local     本地 CSV
+    upstream  上游数据源
+    hybrid    混合（本地 + 上游）
 """
 
 from __future__ import annotations
@@ -25,27 +30,22 @@ except Exception:
     pass
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.normpath(os.path.join(HERE, ".."))
-sys.path.insert(0, os.path.normpath(os.path.join(HERE)))
+sys.path.insert(0, os.path.normpath(HERE))
 
-from database import ChipDatabase, default_database_path  # noqa: E402
-from paths import ensure_user_database, resolve_database_path  # noqa: E402
+from config import MODE_LABELS, add_arguments, build_settings  # noqa: E402
+from sources import SourceLoadError, make_source  # noqa: E402
 from ui import run as run_ui  # noqa: E402
 
 
 def _parse_args():
     parser = argparse.ArgumentParser(
-        description="ChipLookup - 跨平台芯片料号查询器",
+        description="ChipLookup - 跨平台芯片料号查询器（支持本地CSV/上游/混合三种模式）",
     )
-    parser.add_argument(
-        "--db",
-        help="CSV 数据库路径（默认会自动定位到用户级 data/chip_database.csv）",
-        default=None,
-    )
+    add_arguments(parser)
     parser.add_argument(
         "--headless-stats",
         action="store_true",
-        help="不启动 UI，只打印数据库统计信息后退出",
+        help="不启动 UI，只打印数据源统计信息后退出",
     )
     parser.add_argument(
         "--screenshot",
@@ -70,18 +70,24 @@ def _parse_args():
 
 def main() -> int:
     args = _parse_args()
-    if args.db:
-        db_path = args.db
-    else:
-        # 自动定位：优先用户级（exe 旁边 data/），缺则从 bundle 拷贝种子
-        db_path = ensure_user_database()
-    db = ChipDatabase(db_path)
-    if args.screenshot_stitch:
-        setattr(db, "_screenshot_mode", "stitch")
-    print(f"[ChipLookup] 数据库路径：{db.csv_path}")
+    settings = build_settings(args)
+
+    for w in settings.warnings:
+        print(f"[config] {w}")
+
+    print(f"[ChipLookup] 模式：{MODE_LABELS.get(settings.mode, settings.mode)}")
+    try:
+        source = make_source(settings)
+    except SourceLoadError as exc:
+        print(f"[ChipLookup] 启动失败：{exc}", file=sys.stderr)
+        return 1
+    for w in source.warnings:
+        print(f"[source] {w}")
+    print(f"[ChipLookup] 数据源：{source.describe()} 共 {source.count()} 条")
+
     if args.headless_stats:
-        recs = db.list_records()
-        print(f"[stats] 共 {len(recs)} 条记录，源文件：{db.csv_path}")
+        recs = source.list_records()
+        print(f"[stats] 共 {len(recs)} 条记录")
         vendors: dict[str, int] = {}
         types: dict[str, int] = {}
         for r in recs:
@@ -94,8 +100,10 @@ def main() -> int:
         for k, v in sorted(types.items(), key=lambda x: -x[1]):
             print(f"  类型 {k}: {v}")
         return 0
+
     run_ui(
-        db,
+        settings,
+        source,
         screenshot_to=args.screenshot,
         screenshot_query=args.screenshot_query,
         screenshot_mode=args.screenshot_mode,

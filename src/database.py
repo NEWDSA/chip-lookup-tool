@@ -41,6 +41,105 @@ DEFAULT_FIELDS = [
     "die_count", "cs_count", "die_revision", "op_temp", "notes",
 ]
 
+# 尝试的编码顺序：UTF-8(BOM) -> UTF-8 -> GBK -> GB18030 -> Latin-1(兜底)
+_ENCODINGS = ("utf-8-sig", "utf-8", "gbk", "gb18030", "latin-1")
+
+# 整数类型字段：读取时做类型转换/合法性校验
+NUMERIC_FIELDS = ("die_count", "cs_count")
+
+
+def detect_encoding(path: str) -> str:
+    """按解码成功率探测 CSV 实际编码（GBK 库也能正常读取）。"""
+    with open(path, "rb") as f:
+        head = f.read(8192)
+    for enc in _ENCODINGS:
+        try:
+            head.decode(enc)
+            return enc
+        except UnicodeError:
+            continue
+    return "latin-1"
+
+
+def read_csv_records(path: str, *, strict: bool = False):
+    """
+    读取 CSV 并返回 (records, issues)。
+    records：按 DEFAULT_FIELDS 规整好的 dict 列表；
+    issues：校验告警列表（重复主键、非法数值、无法读取等）。
+
+    strict=True 时，致命问题（文件缺失、表头缺失/缺 part_number）抛 ValueError；
+    strict=False 时只记录到 issues，保证容错加载。
+    """
+    issues = []
+    if not os.path.exists(path):
+        if strict:
+            raise ValueError("CSV 文件不存在: %s" % path)
+        return [], ["CSV 文件不存在: %s" % path]
+    try:
+        enc = detect_encoding(path)
+    except OSError as exc:
+        if strict:
+            raise ValueError("无法读取 CSV: %s" % exc) from exc
+        return [], ["无法读取 CSV: %s" % exc]
+
+    records = []
+    seen = set()
+    try:
+        with open(path, "r", encoding=enc, newline="") as f:
+            reader = csv.DictReader(f)
+            headers = [str(h or "").strip() for h in (reader.fieldnames or [])]
+            if not reader.fieldnames:
+                msg = "CSV 表头为空，文件内容无效: %s" % path
+                if strict:
+                    raise ValueError(msg)
+                return [], [msg]
+            if "part_number" not in headers:
+                msg = "CSV 缺少必填表头 part_number: %s" % path
+                if strict:
+                    raise ValueError(msg)
+                return [], [msg]
+            for ln, row in enumerate(reader, start=2):
+                # 跳过空行
+                if not any((v or "").strip() for v in row.values()):
+                    continue
+                # 只保留已知字段，缺失字段补空字符串
+                clean = {k: (row.get(k, "") or "").strip() for k in DEFAULT_FIELDS}
+                # 类型转换 + 校验：数字型字段必须是数值
+                for nf in NUMERIC_FIELDS:
+                    v = clean.get(nf)
+                    if v:
+                        try:
+                            clean[nf] = str(int(v))
+                        except ValueError:
+                            try:
+                                clean[nf] = str(float(v))
+                            except ValueError:
+                                issues.append(
+                                    "第 %d 行 %s='%s' 不是有效的数字，保留原文"
+                                    % (ln, nf, v)
+                                )
+                # 主键查重（part_number 全局唯一）
+                pn = clean["part_number"].upper()
+                if pn in seen:
+                    issues.append(
+                        "part_number 重复已跳过: %s（第 %d 行）"
+                        % (clean["part_number"], ln)
+                    )
+                    continue
+                seen.add(pn)
+                records.append(clean)
+    except OSError as exc:
+        if strict:
+            raise ValueError("无法读取 CSV: %s" % exc) from exc
+        issues.append("无法读取 CSV: %s" % exc)
+        return [], issues
+    return records, issues
+
+
+def validate_csv(path: str):
+    """严格校验 CSV（本地模式入口）。返回 (records, issues)，致命问题抛 ValueError。"""
+    return read_csv_records(path, strict=True)
+
 
 class ChipDatabase:
     """线程安全的内存数据库封装。"""
@@ -49,6 +148,7 @@ class ChipDatabase:
         self.csv_path = csv_path
         self._records: List[dict] = []
         self._lock = threading.RLock()
+        self.warnings: List[str] = []
         self._load()
 
     # ---------- 加载 / 持久化 ----------
@@ -56,17 +156,11 @@ class ChipDatabase:
     def _load(self) -> None:
         if not os.path.exists(self.csv_path):
             self._records = []
+            self.warnings = []
             return
-        with open(self.csv_path, "r", encoding="utf-8-sig", newline="") as f:
-            reader = csv.DictReader(f)
-            self._records = []
-            for row in reader:
-                # 跳过空行
-                if not any((v or "").strip() for v in row.values()):
-                    continue
-                # 只保留已知字段，缺失字段补空字符串
-                clean = {k: (row.get(k, "") or "").strip() for k in DEFAULT_FIELDS}
-                self._records.append(clean)
+        records, issues = read_csv_records(self.csv_path, strict=False)
+        self._records = records
+        self.warnings = list(issues)
 
     def save(self) -> None:
         """把当前内存数据写回 CSV（原子替换）。"""
@@ -140,15 +234,11 @@ class ChipDatabase:
         """
         if not os.path.exists(src_path):
             raise FileNotFoundError(src_path)
+        # 复用统一读取层：自动编码探测 + 校验 + 类型转换
+        rows, issues = read_csv_records(src_path, strict=True)
         added = 0
-        with open(src_path, "r", encoding="utf-8-sig", newline="") as f:
-            reader = csv.DictReader(f)
-            rows = []
-            for row in reader:
-                if not any((v or "").strip() for v in row.values()):
-                    continue
-                rows.append({k: (row.get(k, "") or "").strip() for k in DEFAULT_FIELDS})
         with self._lock:
+            self.warnings = self.warnings + issues
             if replace:
                 self._records = rows
                 return len(rows)

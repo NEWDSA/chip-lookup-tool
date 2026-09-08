@@ -21,6 +21,8 @@ Python 3 + Tkinter，运行时仅依赖标准库，单 exe 仅 ~16 MB，无需�
    候选数 ≤ 8 时不显示任何分页控件（保持简洁）
 10. 上游数据同步：tools/sync_upstream.py 从 fdnext 索引抓取清洗后「只填空」
     补全 model / 厂商，全程纯 Python 标准库，无需安装 Node.js 即可运行。
+11. 三种数据加载模式：本地 CSV / 上游索引 / 混合（合并+去重），
+    启动参数或 chiplookup.json 配置即可切换，UI 顶部也可随时热切换。
 
 目录结构
 --------
@@ -31,12 +33,18 @@ chip-lookup-tool/
 ├── data/
 │   └── chip_database.csv          默认数据库（含 D8DKS 等 30+ 条真实料号）
 ├── src/
-│   ├── main.py                    入口
-│   ├── ui.py                      Tkinter 界面
-│   ├── database.py                CSV 数据层（加载/增删改/导入导出）
+│   ├── main.py                    入口（解析参数/配置 → 构建数据源 → 启动 UI 或 stats）
+│   ├── ui.py                      Tkinter 界面（含顶部数据源模式热切换）
+│   ├── database.py                CSV 数据层（编码探测/校验/加载/增删改/导入导出）
+│   ├── config.py                  模式常量、Settings、chiplookup.json 读写、CLI 参数
+│   ├── sources.py                 三种数据源本地/上游/混合 + 合并去重
+│   ├── upstream.py                上游提供层（复用 fdnext 索引缓存）
 │   ├── search.py                  搜索匹配与排序
 │   ├── paths.py                   数据文件路径解析（exe 模式/源码模式）
 │   └── synthetic_card.py          数据驱动的完整卡片 PNG 渲染（截图/分享用）
+├── tests/
+│   ├── test_modes.py              三模式/异常/配置/CLI 冒烟测试（全离线）
+│   └── fixtures/                  测试用本地 CSV 与上游索引缓存
 ├── tools/
 │   ├── import_export.py           命令行工具：开 UI 也能维护数据
 │   ├── sync_upstream.py           上游数据同步器（纯 Python，无 Node 依赖）
@@ -126,6 +134,55 @@ $ python tools/import_export.py --help
 定时拉取（可选）：用系统计划任务/cron 周期执行上面的同步命令即可，
 例如「每日 02:00 同步」后，UI 内按 F5 刷新即可看到补全结果。
 
+三种数据加载模式（local / upstream / hybrid）
+-----------------------------------------------
+用 `--mode` 或 chiplookup.json 里的 `mode` 选择数据从哪来：
+
+| mode      | 说明 |
+|-----------|------|
+| `local`   | 只加载本地 CSV（默认，行为与旧版一致） |
+| `upstream`| 只用上游 fdnext 索引（不读本地 CSV），适合只查标记码/料号厂商 |
+| `hybrid`  | 本地 CSV + 上游索引合并去重后查询 |
+
+hybrid 的合并优先级（`hybrid_priority`）：
+- `local_first`（默认）：以本地记录为主，本地为空的字段用上游补全；
+  本地已在用人工维护的数据永不被上游覆盖，适合日常使用。
+- `upstream_first`：以上游为主、本地兜底补齐，适合先看上游权威数据。
+
+合并/去重规则：
+- 按 part_number 主键去重（大小写不敏感），重叠料号只保留一条。
+- 「只填空」：主源已有值不被副源覆盖；副源仅在主源该字段为空时补上。
+- 同一标记码对应多个型号时（如 SpecTek 部分码），model 留空待人工确认。
+
+故障降级：
+- 上游加载失败（离线且无缓存/缓存损坏/网络异常）在 hybrid 下不会退出，
+  自动降级仅用本地数据，并在 UI 状态栏提示；local / upstream 单源模式下则报错退出。
+- 上游索引带 7 天新鲜期缓存 + 失败自动降级旧缓存，多数时间可离线使用。
+
+UI 内热切换：窗口顶部「数据源模式」三个分段按钮一键切换，选择会写入
+chiplookup.json 持久化，下次启动沿用。
+
+配置文件 chiplookup.json
+------------------------
+默认放在程序根目录（exe 运行时在 exe 旁）。参数优先级：命令行 > 配置文件 > 默认值。
+
+```jsonc
+{
+  "mode": "hybrid",                 // "local" | "upstream" | "hybrid"
+  "db": "data/chip_database.csv",   // 本地 CSV 路径
+  "hybrid_priority": "local_first", // "local_first" | "upstream_first"
+  // ── 网络类型参数（原「上游」类型；键名保持 upstream_* 兼容既有配置） ──
+  "upstream_offline": false,        // true=禁用联网，只用本地缓存
+  "upstream_refresh": false,        // true=忽略 7 天缓存强制重新下载
+  "upstream_cache_dir": "",         // 缓存目录，空=默认
+  "upstream_timeout": 30,           // 单次下载超时秒数
+  "upstream_retries": 2,            // 下载失败重试次数
+  "upstream_rate_limit": 0.0        // 相邻请求间隔秒数（避免触发限流）
+}
+```
+
+也可在 UI 内切换模式后自动生成该文件（只含被改动的字段）。
+
 CSV 数据字段
 -----------
 必填：part_number（料号，唯一主键）
@@ -133,7 +190,9 @@ CSV 数据字段
     part_number, model, manufacturer, type, capacity, bit_width, voltage, speed,
     package, dimensions, die_count, cs_count, die_revision, op_temp, notes
 
-CSV 必须以 UTF-8 (BOM 可选) 保存。改完保存后，在 UI 内点「刷新数据」或按 F5 即生效。
+CSV 会自动探测编码（UTF-8 BOM / UTF-8 / GBK / GB18030 / Latin-1，常见的中文
+Excel「CSV UTF-8」「另存为 GBK」都能读），推荐用 UTF-8 (BOM 可选) 保存。
+改完保存后，在 UI 内点「刷新数据」或按 F5 即生效。
 
 开发者模式（直接跑源码）
 ------------------------
@@ -141,11 +200,28 @@ CSV 必须以 UTF-8 (BOM 可选) 保存。改完保存后，在 UI 内点「刷�
 $ python src/main.py
 
 参数：
-  --db <path>                     指定数据库路径
-  --headless-stats                仅打印统计信息，不弹 UI
-  --screenshot <path>             启动并截图后退出（调试用，需要 Pillow）
-  --screenshot-query <s>          截图前自动查询一个料号
-  --screenshot-stitch             临时展开 detail 区域，截一张包含全部字段的 PNG
+  --mode <local|upstream|hybrid>    数据加载模式（默认 local）
+  --db <path>                       本地数据库 CSV 路径
+  --config <path>                   指定配置文件（默认 chiplookup.json）
+  --hybrid-priority <en>            本地/上游优先，local_first 或 upstream_first
+  --upstream-offline                禁用联网，只用本地缓存
+  --upstream-refresh                忽略 7 天缓存，强制重新下载
+  --upstream-cache-dir <path>       上游缓存目录
+  --upstream-timeout <sec>          单次下载超时（默认 30）
+  --upstream-retries <n>            下载失败重试次数（默认 2）
+  --upstream-rate-limit <sec>       请求间隔限流（默认 0）
+  --headless-stats                  仅打印统计信息，不弹 UI
+  --screenshot <path>               启动并截图后退出（调试用，需要 Pillow）
+  --screenshot-query <s>            截图前自动查询一个料号
+  --screenshot-stitch               临时展开 detail 区域，截一张包含全部字段的 PNG
+
+示例：
+  $ python src/main.py --mode upstream --upstream-offline --headless-stats
+  $ python src/main.py --mode hybrid --hybrid-priority upstream_first
+  $ python src/main.py --mode local --db data/chip_database.csv
+
+测试（全离线，仅依赖标准库）：
+  $ python tests/test_modes.py       # 三模式 + 异常 + 配置 + CLI 冒烟（33 用例）
 
 合成卡片（数据驱动，100% 完整）：
   $ python src/synthetic_card.py --part D8DKS --part D8DKP

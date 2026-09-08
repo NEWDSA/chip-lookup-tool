@@ -1,0 +1,13 @@
+{
+  "micron": {
+    "D8DKS": "MT60B2G8RZ-56B:D",
+    "D8DKP": "MT60B2G8RZ-46E:D",
+    "MULTI": ["MT40A1G16JC-062E", "MT40A1G8WE-062E"]
+  },
+  "skhynix": {
+    "H58G56AK6A025": "H58G56AK6A025"
+  },
+  "samsung": {
+    "K4ZAF165BM": "K4ZAF165BM-MC16"
+  }
+}

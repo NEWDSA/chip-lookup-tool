@@ -1,0 +1,4 @@
+﻿part_number,model,manufacturer,type,capacity,bit_width,voltage,speed,package,dimensions,die_count,cs_count,die_revision,op_temp,notes
+D8DKS,MT60B2G8RZ-56B:D,Micron,DDR5,16Gb,x8,1.1V VDD,DDR5-5600B CL46,VFBGA-78,7.5x11x0.9,1,1,Rev D,,商用
+D8DKP,,,,,,,,,,,,,
+K4AAG165WA-BCWE,K4AAG165WA-BCWE,,DDR4,16Gb,,,,,,,,,

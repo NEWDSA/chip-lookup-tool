@@ -1,0 +1,12 @@
+{
+  "mode": "upstream",
+  "csv_path": "E:\\study\\zhicun\\chip-lookup-tool\\data\\chip_database.csv",
+  "hybrid_priority": "local_first",
+  "upstream_offline": false,
+  "upstream_refresh": false,
+  "upstream_cache_dir": null,
+  "upstream_timeout": 30.0,
+  "upstream_max_age": 604800.0,
+  "upstream_retries": 2,
+  "upstream_rate_limit": 0.0
+}
