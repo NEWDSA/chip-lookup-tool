@@ -74,6 +74,35 @@ def make_text_for_copy(record: dict) -> str:
     return "\n".join(lines)
 
 
+import re as _re
+
+_CAPACITY_RE = _re.compile(r"(\d+(?:\.\d+)?)\s*[GTgT]", _re.IGNORECASE)
+_BITWIDTH_RE = _re.compile(r"[xX]?(\d+)")
+
+
+def _capacity_display(capacity: str, bit_width: str) -> str:
+    """把原始容量换算为带 GB 的显示文本。
+
+    公式：单颗粒容量(GB) = 标称容量(Gb) ÷ 8
+    例：16Gb → 2 GB；24Gb → 3 GB；4Gb → 0.5 GB
+
+    说明：DRAM 标称容量已包含总存储位数，bit_width 表示数据总线宽度，
+    不参与容量换算。
+    """
+    if not capacity:
+        return capacity
+    cm = _CAPACITY_RE.search(capacity)
+    if not cm:
+        return capacity
+    try:
+        density_g = float(cm.group(1))
+    except (ValueError, IndexError):
+        return capacity
+    gb = density_g / 8
+    gb_str = ("%g" % gb) if gb != int(gb) else str(int(gb))
+    return "%s (%s GB)" % (capacity, gb_str)
+
+
 # ---------------- 细条滚动条（详情区） ----------------
 
 def _hex_to_rgb(value: str) -> Tuple[int, int, int]:
@@ -637,7 +666,7 @@ class App(tk.Tk):
             ("part_number", 110, "w"),
             ("model", 200, "w"),
             ("manufacturer", 110, "w"),
-            ("capacity", 80, "center"),
+            ("capacity", 130, "center"),
             ("type", 80, "center"),
         ]:
             self.tree.heading(c, text={
@@ -1018,7 +1047,7 @@ class App(tk.Tk):
                     mark + rec.get("part_number", ""),
                     rec.get("model", ""),
                     rec.get("manufacturer", ""),
-                    rec.get("capacity", ""),
+                    _capacity_display(rec.get("capacity", ""), rec.get("bit_width", "")),
                     rec.get("type", ""),
                 ),
             )
@@ -1032,11 +1061,11 @@ class App(tk.Tk):
     # 候选表五列的权重与最小列宽（仅布局细节，不改变列语义/顺序）
     _TREE_COL_MIN = {
         "part_number": 64, "model": 50, "manufacturer": 44,
-        "capacity": 40, "type": 40,
+        "capacity": 130, "type": 40,
     }
     _TREE_COL_WEIGHT = {
         "part_number": 0.35, "model": 0.30, "manufacturer": 0.20,
-        "capacity": 0.075, "type": 0.075,
+        "capacity": 0.10, "type": 0.05,
     }
 
     def _fit_tree_columns(self, width: Optional[int] = None):
@@ -1503,8 +1532,7 @@ class App(tk.Tk):
             f"[{v}]" for v in [
                 record.get("manufacturer", ""),
                 record.get("type", ""),
-                record.get("capacity", ""),
-                record.get("bit_width", ""),
+                _capacity_display(record.get("capacity", ""), record.get("bit_width", "")),
             ] if v
         )
         if tag_text:
@@ -1518,7 +1546,7 @@ class App(tk.Tk):
                 ("型号 Model", record.get("model", "")),
             ]),
             ("存储参数", [
-                ("容量 Capacity", record.get("capacity", "")),
+                ("容量 Capacity", _capacity_display(record.get("capacity", ""), record.get("bit_width", ""))),
                 ("位宽 Bit Width", record.get("bit_width", "")),
                 ("速度 Speed", record.get("speed", "")),
                 ("电压 Voltage", record.get("voltage", "")),
