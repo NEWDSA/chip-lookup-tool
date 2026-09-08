@@ -16,10 +16,13 @@ ChipLookup 可检索的记录列表。网络重试 / 请求限流 / 数据完整
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
-from typing import Any, Dict, List, Optional
+import tempfile
+from threading import RLock
+from typing import Any, Callable, Dict, List, Optional
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
@@ -36,6 +39,153 @@ from fdnext.indexes import (  # noqa: E402
 )
 
 _log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# 解码字段 memo（模型 → 补全后的 fields）
+# ---------------------------------------------------------------------------
+# 上游/混合每次切换都会把全部 ~4 万条扩展记录交给 fdnext 引擎逐条解码（实测
+# 约 10s/次）。实际上很多记录共享同一个型号，且同一型号在进程内会被反复构建。
+# 这里做两层缓存：
+#   1) 进程内 memo（按 cache_dir 分组，跨数据源实例共享）；
+#   2) 落盘 sidecar（存到索引缓存目录），让「下一次启动/切换」直接复用，
+#      只有单次构建新增量足够大（说明是真实全量索引）才写盘，避免污染
+#      只读 fixture / 源码目录等小缓存目录。
+# 仅缓存 status=="ok" 且 fields 非空的解码结果；失败的型号每次重新尝试（代价低）。
+
+DECODE_MEMO_SCHEMA = "fdnext-decode-fields-v1"
+DECODE_MEMO_FILENAME = "fdnext-decode-fields-v1.json"
+# 单次构建新增模型数达到该值才落盘（真实索引 ~4 万；测试 fixture 只有几条）
+DECODE_MEMO_MIN_NEW_FOR_FLUSH = 200
+_MEMO_REGISTRY: Dict[str, "DecodeMemo"] = {}
+_MEMO_REGISTRY_LOCK = RLock()
+
+
+def _rules_marker() -> str:
+    """规则来源标识：内置快照存在时用其版本，否则标记为远程。"""
+    try:
+        from fdnext import resources as _res
+        if _res.snapshot_dir():
+            return "%s@%s" % (_res.SNAPSHOT_DIRNAME, _res.SNAPSHOT_VERSION)
+    except Exception:
+        pass
+    return "remote"
+
+
+class DecodeMemo:
+    """型号 → fdnext 解码 fields 的线程安全缓存（进程内 + 可选落盘）。"""
+
+    def __init__(self, cache_dir: str):
+        self.cache_dir = cache_dir
+        self._lock = RLock()
+        self._fields: Dict[str, dict] = {}
+        self._loaded = False   # 已从磁盘载入（磁盘文件存在且 schema 匹配）
+        self._new_count = 0    # 本次进程内新增的条目数（用于决定是否落盘）
+
+    # -- 读取 ----------------------------------------------------------
+
+    def _ensure_loaded(self) -> None:
+        if self._loaded:
+            return
+        path = os.path.join(self.cache_dir, DECODE_MEMO_FILENAME)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if (
+                isinstance(data, dict)
+                and data.get("schema") == DECODE_MEMO_SCHEMA
+                and data.get("rules") == _rules_marker()
+            ):
+                fields = data.get("fields")
+                if isinstance(fields, dict):
+                    self._fields = {
+                        k: v for k, v in fields.items() if isinstance(v, dict)
+                    }
+        except (OSError, ValueError):
+            pass
+        self._loaded = True
+
+    def get(self, model: str) -> Optional[dict]:
+        with self._lock:
+            self._ensure_loaded()
+            return self._fields.get(model)
+
+    def put(self, model: str, fields: dict) -> None:
+        """记录某型号的解码结果。
+
+        允许空 dict：`ok 但无可用字段` 或 `解码未命中` 也落缓存，
+        避免每个会话/每次切换都对同一批型号重复尝试解码
+        （解码结果在同一规则版本下是确定的）。
+        """
+        if not model or fields is None:
+            return
+        with self._lock:
+            self._ensure_loaded()
+            if model not in self._fields:
+                self._fields[model] = dict(fields)
+                self._new_count += 1
+
+    # -- 落盘 ----------------------------------------------------------
+
+    def flush(self, min_new: int = DECODE_MEMO_MIN_NEW_FOR_FLUSH) -> bool:
+        """新增量达到阈值才原子写盘。返回是否写盘。"""
+        with self._lock:
+            if self._new_count < min_new or not self._fields:
+                return False
+            payload = {
+                "schema": DECODE_MEMO_SCHEMA,
+                "rules": _rules_marker(),
+                "fields": self._fields,
+            }
+            path = os.path.join(self.cache_dir, DECODE_MEMO_FILENAME)
+            self._new_count = 0
+        try:
+            os.makedirs(self.cache_dir, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(
+                prefix=".fdnext-decode-", suffix=".tmp", dir=self.cache_dir
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, ensure_ascii=False)
+                os.replace(tmp, path)
+            except Exception:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+                raise
+        except OSError as exc:
+            _log.debug("解码 memo 落盘失败（忽略）: %s", exc)
+            return False
+        _log.info("解码 memo 已落盘：%d 个型号 -> %s", len(self._fields), path)
+        return True
+
+
+def _memo_for(cache_dir: str) -> DecodeMemo:
+    """取（或创建）某个索引缓存目录对应的进程内 memo。"""
+    with _MEMO_REGISTRY_LOCK:
+        memo = _MEMO_REGISTRY.get(cache_dir)
+        if memo is None:
+            memo = DecodeMemo(cache_dir)
+            _MEMO_REGISTRY[cache_dir] = memo
+        return memo
+
+
+class _LazyEngine:
+    """惰性 fdnext 引擎：首次真正需要 decode_part 时才编译规则。
+
+    memo 已覆盖全部型号时（热切换/二次启动），引擎工厂不会触发，
+    省掉每次数据源重建 ~0.2s 的规则编译开销。
+    """
+
+    def __init__(self, factory: Callable[[], Any]):
+        self._factory = factory
+        self._engine = None
+
+    def decode_part(self, model: str) -> dict:
+        if self._engine is None:
+            self._engine = self._factory()
+        return self._engine.decode_part(model)
 
 
 class UpstreamLoadError(Exception):
@@ -127,12 +277,15 @@ def _enrich_from_engine(rec: dict, decode_result: dict) -> dict:
 def build_upstream_records(
     idx: FdnextIndexes,
     engine: Optional[Any] = None,
+    memo: Optional[DecodeMemo] = None,
 ) -> List[dict]:
     """把上游索引转成记录列表（与本地 CSV 字段对齐）。
 
     - 标记码：part_number=码，model=唯一型号（多型号歧义时留空待确认），manufacturer=厂商；
     - 完整料号：part_number=料号，model=料号（沿用本地「料号即型号」惯例），manufacturer=厂商。
-    - 若提供 fdnext engine，自动解码型号补全 type/capacity 等规格字段。
+    - 若提供 fdnext engine，自动解码型号补全 type/capacity 等规格字段；
+      传入 memo 时同一型号只解码一次，之后从 memo 直接取 fields。
+    - 若 engine 为空但 memo 有缓存，也会用 memo 补全（引擎可整体跳过）。
 
     按 part_number 去重（标记码优先）。
     """
@@ -140,14 +293,25 @@ def build_upstream_records(
     seen = set()
 
     def _decode_and_enrich(rec: dict) -> None:
-        """尝试用 fdnext 引擎解码型号并补全字段。"""
+        """尝试用 fdnext 引擎解码型号并补全字段（优先命中 memo）。"""
         model = rec.get("model", "")
-        if not model or not engine:
+        if not model:
+            return
+        if memo is not None:
+            cached = memo.get(model)
+            if cached is not None:
+                _enrich_from_engine(rec, {"fields": cached})
+                return
+        if not engine:
             return
         try:
             result = engine.decode_part(model)
+            if memo is not None:
+                # 空/未命中结果也缓存（同一规则版本下解码确定，无需每轮重试）
+                fields = (result.get("fields") or {}) if result.get("status") == "ok" else {}
+                memo.put(model, fields)
             if result.get("status") == "ok":
-                _enrich_from_engine(rec, result)
+                _enrich_from_engine(rec, {"fields": result.get("fields") or {}})
         except Exception:
             pass  # 解码失败不影响记录基本数据
 
@@ -217,16 +381,26 @@ class UpstreamProvider:
         except (OSError, ValueError, RuntimeError, FileNotFoundError) as exc:
             raise UpstreamLoadError("%s" % exc) from exc
 
-        # 尝试加载 fdnext 解码引擎（补全规格字段）
+        # 惰性加载 fdnext 解码引擎（补全规格字段）：memo 命中足够多时
+        # （热切换/二次启动）根本不会触发引擎编译，仅首次解码才付费。
+        memo = _memo_for(self.cache_dir)
         engine = None
         try:
             from fdnext.engine import load_engine
-            engine = load_engine(self.cache_dir, offline=self.offline, refresh=self.refresh)
+
+            def _factory():
+                return load_engine(
+                    self.cache_dir, offline=self.offline, refresh=self.refresh
+                )
+
+            engine = _LazyEngine(_factory)
         except Exception as exc:
             _log.debug("fdnext 解码引擎加载失败，跳过型号解码补全: %s", exc)
 
+        records = build_upstream_records(idx, engine=engine, memo=memo)
+        memo.flush()
         return UpstreamResult(
-            records=build_upstream_records(idx, engine=engine),
+            records=records,
             counts=idx.counts(),
             sources=src_map,
             cache_dir=self.cache_dir,

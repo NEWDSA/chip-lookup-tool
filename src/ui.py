@@ -19,15 +19,18 @@ Tkinter UI。结构：
 
 from __future__ import annotations
 
+import copy
 import math
 import os
+import queue
+import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
-from config import MODE_LABELS, MODE_UPSTREAM, Settings
-from search import lookup_exact, search, suggest_terms
-from sources import RecordSource, SourceLoadError, SourceUnsupportedError, make_source
+from config import MODE_LABELS, Settings
+from search import cheap_partials, lookup_exact, search, suggest_terms, warm_prepared
+from sources import RecordSource, make_source
 
 
 # ---------------- 配色（深色卡片风，参考 itxtech.fm）----------------
@@ -396,6 +399,27 @@ class App(tk.Tk):
         self._candidates: List[Tuple[dict, float, str]] = []
         self._selected_index: int = -1  # 候选列表中选中项（全局索引，与 tree iid 一致）
 
+        # ---------- 数据源切换（后台线程 + 队列轮询，latest-wins） ----------
+        # 数据源重建（尤其上游/混合：~4 万条 × fdnext 解码）耗时秒级，
+        # 不能在 Tk 主线程里同步执行，否则窗口冻结。方案：
+        #   1. 工作线程里 make_source + list_records，结果放 queue；
+        #   2. 主线程用 after() 轮询队列取回结果并一次性落地（token 防串台）；
+        #   3. 忙碌期间允许继续点 radio：只记「最新想要的目标模式」，
+        #      当前切换收尾后再启动下一个（latest-wins，不做中间切换）。
+        #   4. 已构建好的数据源按模式缓存：来回切换/再次点击不再重建。
+        self._source_cache: Dict[str, RecordSource] = {
+            getattr(self.source, "MODE", settings.mode): self.source
+        }
+        self._switch_busy = False          # 是否正在后台构建
+        self._switch_token = 0             # 递增令牌，用于忽略过期结果
+        self._desired_mode: Optional[str] = None   # 用户最新想切到的模式
+        self._pending_force = False        # 下一个切换是否为强制重建（F5 刷新）
+        self._switch_queue: "queue.Queue[tuple]" = queue.Queue()
+        self._polling = False              # 队列轮询是否已挂起
+        self._source_radios: List[ttk.Radiobutton] = []
+        # 输入防抖：连续敲键只触发最后一次查询（上游 4 万条时省去中间全量扫描）
+        self._query_after_id: Optional[str] = None
+
         # ---------- 候选区分页参数 ----------
         self.PAGE_SIZE = 8                # 每页条数，与 tree 可见行数一致
         self.page_mode = tk.StringVar(value="paginate")  # "paginate" | "load_more"
@@ -610,6 +634,7 @@ class App(tk.Tk):
                 command=self._on_source_radio,
             )
             rb.pack(side=tk.LEFT, padx=(0, 2))
+            self._source_radios.append(rb)
 
         # 主体（左右两栏 + 可拖分隔条）
         body = ttk.Frame(self, style="TFrame", padding=(14, 0))
@@ -913,41 +938,180 @@ class App(tk.Tk):
         self._set_source_mode(self.var_source_mode.get())
 
     def _set_source_mode(self, mode: str):
-        """切换数据源模式：重建数据源、刷新候选/状态，并把模式写回配置文件。"""
-        if mode == self.settings.mode:
+        """radio 回调入口：请求切到某数据源模式（后台重建，不阻塞 UI）。
+
+        忙碌期间可以继续点别的模式——只记最新目标（latest-wins），
+        当前切换收尾后再启动下一个，避免中间态重建浪费。
+        """
+        if mode == self.settings.mode and not self._switch_busy:
+            return  # 已在该模式且无在途切换
+        self._request_source_mode(mode)
+
+    def _request_source_mode(self, mode: str, force: bool = False):
+        """登记一次切换/刷新请求。force=True 表示无视缓存强制重建（F5）。"""
+        self._desired_mode = mode
+        self._pending_force = force
+        self._pump_switch()
+
+    def _pump_switch(self):
+        """空闲时启动一次在途切换；忙碌时由收尾逻辑（latest-wins）负责接力。"""
+        if self._switch_busy:
             return
-        previous = self.settings.mode
-        self.settings.mode = mode
-        try:
-            new_source = make_source(self.settings)
-        except SourceLoadError as exc:
-            self.settings.mode = previous
-            self._refresh_source_buttons()  # 回滚 radio 选中项
-            messagebox.showerror(
-                "切换模式失败", f"无法载入「{MODE_LABELS.get(mode, mode)}」数据源：\n{exc}"
-            )
+        mode = self._desired_mode
+        if mode is None:
             return
-        self.source = new_source
-        self._records_cache = self.source.list_records()
-        # 持久化模式选择（配置文件下次启动生效）
+        if not self._pending_force and mode == self.settings.mode:
+            # 已在该模式、又无强制刷新 → 无事可做
+            self._desired_mode = None
+            self._pending_force = False
+            self._refresh_source_buttons()
+            return
+
+        self._switch_busy = True
+        force = self._pending_force
+        self._pending_force = False
+        self._desired_mode = None
+        self._switch_token += 1
+        token = self._switch_token
+        label = MODE_LABELS.get(mode, mode)
+        self.status_label.configure(
+            text=f"正在{'刷新' if force else '切换'}数据源至「{label}」…"
+        )
+        self._start_switch_worker(token, mode, force)
+        self._ensure_polling()
+
+    def _start_switch_worker(self, token: int, mode: str, force: bool):
+        """后台线程重建数据源（make_source + 全量 list_records），结果入队。"""
+        snapshot = copy.copy(self.settings)
+        snapshot.mode = mode
+
+        def _run():
+            try:
+                src = self._build_source_snapshot(snapshot, mode, force)
+                records = src.list_records()
+                # 后台线程顺手把 ~40k×10 字段的预归一化做好，切完首次按键不再卡
+                try:
+                    warm_prepared(records)
+                except Exception:
+                    pass  # 预热失败无碍：首次查询惰性重建即可
+                self._switch_queue.put((token, "ok", mode, src, records))
+            except Exception as exc:  # SourceLoadError / OSError 等一律兜底
+                self._switch_queue.put((token, "err", mode, exc))
+
+        threading.Thread(
+            target=_run, daemon=True, name="chiplookup-source-switch"
+        ).start()
+
+    def _build_source_snapshot(
+        self, snapshot: Settings, mode: str, force: bool
+    ) -> RecordSource:
+        """按模式取缓存或重建数据源。仅在后台线程调用。"""
+        if not force:
+            cached = self._source_cache.get(mode)
+            if cached is not None:
+                return cached
+        return make_source(snapshot)
+
+    def _ensure_polling(self):
+        """确保主线程有一个 after() 轮询在跑（仅在途切换期间）。"""
+        if self._polling:
+            return
+        self._polling = True
+        self.after(40, self._poll_switch_queue)
+
+    def _poll_switch_queue(self):
+        """主线程轮询后台切换结果并落地（token 校验防串台）。"""
         try:
-            self.settings.save()
-        except OSError as exc:
-            self._toast(f"模式已切换，但配置保存失败：{exc}")
-        self._refresh_status()
-        self._refresh_source_buttons()
-        if self.var_query.get().strip():
-            self._run_query()
+            while True:
+                item = self._switch_queue.get_nowait()
+                token = item[0]
+                if token != self._switch_token:
+                    continue  # 过期结果（理论上忙碌门控下不会出现）
+                kind = item[1]
+                mode = item[2]
+                if kind == "ok":
+                    _, _, _, src, records = item
+                    self._apply_switch_result(token, mode, src, records)
+                else:
+                    _, _, _, exc = item
+                    self._handle_switch_error(token, mode, exc)
+        except queue.Empty:
+            pass
+        # 仍在途 → 继续轮询；否则停表
+        if self._switch_busy:
+            self.after(40, self._poll_switch_queue)
         else:
-            self._clear_detail()
-            self._render_detail_empty()
+            self._polling = False
+
+    def _apply_switch_result(
+        self, token: int, mode: str, src: RecordSource, records: List[dict]
+    ):
+        """后台构建成功：一次性把新数据源落到主线程状态（不阻塞）。"""
+        self.source = src
+        self._source_cache[mode] = src
+        self._records_cache = records
+        previous = self.settings.mode
+        changed = previous != mode
+        self.settings.mode = mode
+        if changed:
+            try:
+                self.settings.save()  # 持久化模式选择（配置文件下次启动生效）
+            except OSError as exc:
+                self._toast(f"模式已切换，但配置保存失败：{exc}")
+        self._refresh_status()
+        # 若无更新的切换目标，把 radio 与查询结果对齐；否则让位给最新请求
+        if self._desired_mode is None:
+            self._refresh_source_buttons()
+            if changed:
+                label = MODE_LABELS.get(mode, mode)
+                self._toast(f"已切换至「{label}」：{self.source.describe()} 共 {len(records)} 条")
+            else:
+                self._toast(f"已刷新：{self.source.describe()} 共 {len(records)} 条")
+            if self.var_query.get().strip():
+                self._run_query()
+            else:
+                self._clear_detail()
+                self._render_detail_empty()
+            if not changed and self.on_change:
+                self.on_change()
+        self._switch_busy = False
+        self._pump_switch()
+
+    def _handle_switch_error(self, token: int, mode: str, exc: Exception):
+        """后台构建失败：回滚 radio/状态；若用户又点了新模式则直接接力。"""
+        self._switch_busy = False
+        if self._desired_mode is None:
+            # 没有更新的目标 → 回滚到当前已加载模式并提示
+            self._refresh_source_buttons()
+            self._refresh_status()
+            messagebox.showerror(
+                "切换模式失败",
+                f"无法载入「{MODE_LABELS.get(mode, mode)}」数据源：\n{exc}",
+            )
+        # 已有更新的目标（用户忙中又点了别的模式）→ 不打断，直接跑下一个
+        self._pump_switch()
+
+    def _cancel_pending_query(self):
+        """取消尚未触发的防抖查询（回车/搜索按钮等显式动作前调用）。"""
+        if self._query_after_id is not None:
+            try:
+                self.after_cancel(self._query_after_id)
+            except Exception:
+                pass
+            self._query_after_id = None
 
     def _on_query_change(self):
-        """输入即响应：边输入边实时给候选列表。"""
+        """输入防抖：连续敲键只调度一次查询，避免上游 4 万条全量扫描。"""
+        self._cancel_pending_query()
+        self._query_after_id = self.after(150, self._flush_query)
+
+    def _flush_query(self):
+        self._query_after_id = None
         self._run_query()
 
     def _on_enter(self):
         """回车：如果候选唯一或已选定某项 → 显示详情；否则聚焦候选列表第一项。"""
+        self._cancel_pending_query()
         if not self._candidates:
             self._run_query()
             return
@@ -967,6 +1131,7 @@ class App(tk.Tk):
 
     def _on_fuzzy(self):
         """显式「搜索」按钮：强制模糊模式（即使恰好精确匹配也展示全部候选）。"""
+        self._cancel_pending_query()
         self._run_query()
 
     def _on_arrow_up(self, event=None):
@@ -1465,13 +1630,11 @@ class App(tk.Tk):
         exacts = lookup_exact(q, self._records_cache)
         if exacts:
             results = [(r, 1001.0, "part_number 精确匹配") for r in exacts]
-            # 紧接着把部分匹配追加在候选里
-            fuzzy = search(q, self._records_cache, top_n=20)
+            # 精确命中后不再对 4 万条做全量模糊扫描，只用廉价匹配（前缀/包含）
+            # 快速把相近料号垫在精确结果下方，体感几乎无延迟
             seen = {id(r) for r, _, _ in results}
-            for r, s, hit in fuzzy:
-                if id(r) not in seen:
-                    results.append((r, s, hit))
-                    seen.add(id(r))
+            partials = cheap_partials(q, self._records_cache, top_n=20, exclude_ids=seen)
+            results.extend(partials)
             self._candidates = results[:20]
         else:
             self._candidates = search(q, self._records_cache, top_n=20)
@@ -1684,6 +1847,10 @@ class App(tk.Tk):
         except Exception as exc:
             messagebox.showerror("导入失败", str(exc))
             return
+        # CSV 已变化：所有读取该 CSV 的模式缓存全部失效（import_csv 已就地
+        # reload 当前 source，把它重新放回缓存即可；其余模式下次切换再重建）
+        self._source_cache.clear()
+        self._source_cache[self.settings.mode] = self.source
         # 重新加载缓存
         self._records_cache = self.source.list_records()
         self._refresh_status()
@@ -1713,18 +1880,13 @@ class App(tk.Tk):
         self._toast(f"已导出 {n} 条 -> {os.path.basename(path)}")
 
     def _reload_db(self):
-        try:
-            self.source.reload()
-        except SourceLoadError as exc:
-            messagebox.showerror("刷新失败", str(exc))
+        """F5：强制重建当前模式数据源（后台线程执行，UI 不冻结）。"""
+        if self._switch_busy:
+            self._toast("正在切换/刷新数据源，请稍候…")
             return
-        self._records_cache = self.source.list_records()
-        self._refresh_status()
-        self._toast("已从磁盘/缓存刷新")
-        if self.var_query.get().strip():
-            self._run_query()
-        if self.on_change:
-            self.on_change()
+        # 丢弃当前模式缓存，确保真正重读磁盘/索引
+        self._source_cache.pop(self.settings.mode, None)
+        self._request_source_mode(self.settings.mode, force=True)
 
 
 def run(settings: Settings, source: RecordSource,

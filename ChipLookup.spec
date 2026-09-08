@@ -8,6 +8,10 @@
 #   - runtime 启动时会把 _MEIPASS/data/chip_database.csv 拷一份到 exe 旁边 data/
 #     (src/paths.py: ensure_user_database)
 #   - 因此用户对数据库的所有增删改都写到「exe 旁边 data/」里，可长期持久
+#   - fdnext/data/fdnext-core-3.2.0 是规则快照（~887KB：part/identifier/nand-die
+#     specs），打包后资源层在 exe 内直接离线可用（src/fdnext/resources.py:
+#     snapshot_dir() 会命中 _MEIPASS/fdnext/data/fdnext-core-3.2.0），
+#     避免首启走网络下载规则、以及解码热路径在打包后退化的问题。
 #
 # 兼容性提示：
 #   - 本 spec 用 Python 3.11 打包时，产物兼容 Win10+，不兼容 Windows 7
@@ -29,6 +33,9 @@ a = Analysis(
     binaries=[],
     datas=[
         (os.path.join(PROJECT_ROOT, 'data'), 'data'),
+        # 规则快照：src/fdnext/data/fdnext-core-3.2.0/*.json → _MEIPASS/fdnext/data/fdnext-core-3.2.0/
+        (os.path.join(PROJECT_ROOT, 'src', 'fdnext', 'data'),
+         'fdnext/data'),
     ],
     hiddenimports=[],
     hookspath=[],

@@ -120,6 +120,10 @@ class LocalSource(RecordSource):
     def list_records(self) -> List[dict]:
         return [dict(r) for r in self._records]
 
+    def count(self) -> int:
+        # 直接数内部列表，避免基类 len(list_records()) 每次状态刷新整表复制
+        return len(self._records)
+
     def display_name(self) -> str:
         return os.path.basename(self.csv_path)
 
@@ -185,6 +189,9 @@ class UpstreamSource(RecordSource):
 
     def list_records(self) -> List[dict]:
         return [dict(r) for r in self._records]
+
+    def count(self) -> int:
+        return len(self._records)
 
     def display_name(self) -> str:
         m = self._counts.get("marks", 0)
@@ -279,6 +286,7 @@ class HybridSource(RecordSource):
         self.csv_path = settings.csv_path or default_database_path()
         self.local_warnings: List[str] = []
         self.upstream_warnings: List[str] = []
+        self._local_count = 0
         self.reload()
 
     def reload(self) -> None:
@@ -286,9 +294,11 @@ class HybridSource(RecordSource):
         try:
             local_records, local_issues = validate_csv(self.csv_path)
             self.local_warnings = list(local_issues)
+            self._local_count = len(local_records)
         except ValueError as exc:
             self.local_warnings = ["本地 CSV 加载失败: %s" % exc]
             local_records = []
+            self._local_count = 0
 
         # 2) 上游索引（容错：失败记告警，不中断）
         provider = UpstreamProvider(
@@ -331,14 +341,11 @@ class HybridSource(RecordSource):
     def list_records(self) -> List[dict]:
         return [dict(r) for r in self._records]
 
+    def count(self) -> int:
+        return len(self._records)
+
     def display_name(self) -> str:
-        n_local = 0
-        try:
-            n_local, _ = validate_csv(self.csv_path)
-            n_local = len(n_local)
-        except ValueError:
-            n_local = 0
-        parts = ["本地 %d" % n_local]
+        parts = ["本地 %d" % self._local_count]
         up = self._up_counts
         if up:
             parts.append("网络 %d" % (up.get("marks", 0) + up.get("pn", 0)))
