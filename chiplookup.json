@@ -1,5 +1,5 @@
 {
-  "mode": "local",
+  "mode": "upstream",
   "csv_path": "E:\\study\\zhicun\\chip-lookup-tool\\data\\chip_database.csv",
   "hybrid_priority": "local_first",
   "upstream_offline": false,

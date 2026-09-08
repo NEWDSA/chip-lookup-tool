@@ -37,12 +37,44 @@ COLOR_CARD        = "#1c2735"   # 卡片背景
 COLOR_CARD_HOVER  = "#243443"   # 卡片悬浮
 COLOR_BORDER      = "#2a3a4f"   # 边框
 COLOR_TEXT        = "#e6edf3"   # 主文字
-COLOR_TEXT_DIM    = "#8aa0b4"   # 次文字
+COLOR_TEXT_DIM    = "#9bb0c4"   # 次文字（提亮至 WCAG AA 达标，对比度 5.5:1+）
 COLOR_ACCENT      = "#16c47e"   # 强调绿（解析料号按钮）
-COLOR_ACCENT2     = "#3b82f6"   # 强调蓝（搜索按钮）
+COLOR_ACCENT2     = "#4a90e0"   # 强调蓝（搜索按钮，提亮至 5.2:1 对比度）
 COLOR_WARN        = "#f59e0b"   # 警告黄
 COLOR_DANGER      = "#ef4444"   # 危险红
-COLOR_FOCUS       = "#2dd4bf"   # 选中态
+COLOR_FOCUS       = "#38bdf8"   # 选中态（偏蓝，与 Accent Green 区分）
+
+
+# ---------------- Design Tokens ----------------
+# 字号层级
+FONT_SIZE_XS   = 9
+FONT_SIZE_SM   = 10
+FONT_SIZE_MD   = 11
+FONT_SIZE_LG   = 12
+FONT_SIZE_XL   = 13
+FONT_SIZE_XXL  = 16
+
+# 字体族
+FONT_FAMILY_UI    = "Microsoft YaHei UI"
+FONT_FAMILY_MONO  = "Consolas"
+
+# 间距系统
+SPACE_XXS  = 2
+SPACE_XS   = 4
+SPACE_SM   = 6
+SPACE_MD   = 8
+SPACE_LG   = 10
+SPACE_XL   = 12
+SPACE_XXL  = 14
+SPACE_XXXL = 16
+
+# 按钮内边距（3 种规格）
+BTN_PADDING_SM = (10, 5)     # 紧凑按钮（ModeSel/ModeRadio）
+BTN_PADDING_MD = (12, 8)     # 次按钮（Ghost）
+BTN_PADDING_LG = (14, 8)     # 主按钮（Accent/Blue）
+
+# 卡片内边距
+CARD_PADDING = (20, 16)
 
 
 # ---------------- 工具函数 ----------------
@@ -433,10 +465,10 @@ class App(tk.Tk):
             foreground="#0e1620",
             borderwidth=0,
             focusthickness=0,
-            padding=(14, 8),
-            font=("Microsoft YaHei UI", 10, "bold"),
+            padding=BTN_PADDING_LG,
+            font=(FONT_FAMILY_UI, FONT_SIZE_SM, "bold"),
         )
-        style.map("Accent.TButton", background=[("active", "#0fa970"), ("disabled", "#3a4a48")], foreground=[("disabled", "#9eb7b1")])
+        style.map("Accent.TButton", background=[("active", "#0fa970"), ("disabled", "#3a4a48")], foreground=[("disabled", "#b0c4d4")])
 
         style.configure(
             "Blue.TButton",
@@ -444,8 +476,8 @@ class App(tk.Tk):
             foreground="#ffffff",
             borderwidth=0,
             focusthickness=0,
-            padding=(14, 8),
-            font=("Microsoft YaHei UI", 10, "bold"),
+            padding=BTN_PADDING_LG,
+            font=(FONT_FAMILY_UI, FONT_SIZE_SM, "bold"),
         )
         style.map("Blue.TButton", background=[("active", "#2563eb"), ("disabled", "#3b4862")])
 
@@ -455,8 +487,8 @@ class App(tk.Tk):
             foreground=COLOR_TEXT,
             borderwidth=0,
             focusthickness=0,
-            padding=(12, 8),
-            font=("Microsoft YaHei UI", 10),
+            padding=BTN_PADDING_MD,
+            font=(FONT_FAMILY_UI, FONT_SIZE_SM),
         )
         style.map("Ghost.TButton", background=[("active", COLOR_BORDER)])
 
@@ -467,8 +499,8 @@ class App(tk.Tk):
             foreground=COLOR_TEXT,
             borderwidth=0,
             focusthickness=0,
-            padding=(10, 4),
-            font=("Microsoft YaHei UI", 9),
+            padding=BTN_PADDING_SM,
+            font=(FONT_FAMILY_UI, FONT_SIZE_XS),
         )
         style.map("ModeSel.TButton", background=[("active", "#3a4d63")])
         style.configure(
@@ -477,8 +509,8 @@ class App(tk.Tk):
             foreground="#0e1620",
             borderwidth=0,
             focusthickness=0,
-            padding=(10, 4),
-            font=("Microsoft YaHei UI", 9, "bold"),
+            padding=BTN_PADDING_SM,
+            font=(FONT_FAMILY_UI, FONT_SIZE_XS, "bold"),
         )
         style.map("ModeSelActive.TButton", background=[("active", "#0fa970")])
 
@@ -489,8 +521,8 @@ class App(tk.Tk):
             foreground=COLOR_TEXT,
             borderwidth=0,
             focusthickness=0,
-            padding=(10, 5),
-            font=("Microsoft YaHei UI", 9),
+            padding=BTN_PADDING_SM,
+            font=(FONT_FAMILY_UI, FONT_SIZE_XS),
             indicatoron=False,
             focuscolor="",          # 去掉 clam 主题自带的焦点虚框
         )
@@ -516,7 +548,7 @@ class App(tk.Tk):
             foreground=COLOR_TEXT,
             borderwidth=0,
             rowheight=32,
-            font=("Consolas", 11),
+            font=("Microsoft YaHei UI", 10),
         )
         style.configure(
             "Candidate.Treeview.Heading",
@@ -1515,7 +1547,7 @@ class App(tk.Tk):
     def _render_detail(self, record: dict):
         self._clear_detail()
         # 主信息卡
-        head = ttk.Frame(self.detail_inner, style="Card.TFrame", padding=(20, 18))
+        head = ttk.Frame(self.detail_inner, style="Card.TFrame", padding=CARD_PADDING)
         head.pack(fill=tk.X, pady=(0, 10))
         ttk.Label(
             head,
