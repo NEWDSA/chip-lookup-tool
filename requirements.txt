@@ -9,6 +9,10 @@ openpyxl>=3.1.0
 # 调试截图功能
 pillow>=10.0.0
 
+# 手写数学公式识别（白板功能）
+pix2tex[gui]>=0.1.4
+sympy>=1.12
+
 # 打 exe 用（按需安装）
 ; pyinstaller>=5.13.2 ; < 6.0    ; 用于 Win7 兼容版本
 ; pyinstaller>=6.0              ; 用于 Win10+/Win11 当前版本

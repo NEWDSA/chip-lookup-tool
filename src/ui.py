@@ -35,6 +35,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from config import MODE_LABELS, Settings
 from database import default_database_path
+from math_canvas import MathCanvasWithRecognizer
 from paths import bundle_root
 from search import cheap_partials, lookup_exact, search, suggest_terms, warm_prepared
 from sources import RecordSource, make_source
@@ -1014,6 +1015,41 @@ class App(tk.Tk):
         self.btn_fuzzy.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
         ToolTip(self.btn_fuzzy, "在当前数据源中模糊搜索（回车同效）")
 
+        # 手写数学公式区域
+        math_frame = ttk.Frame(left, style="Panel.TFrame")
+        math_frame.pack(fill=tk.X, pady=(0, 12))
+
+        ttk.Label(math_frame, text="手写数学公式", style="Panel.TLabel",
+                  font=("Microsoft YaHei UI", 10, "bold")).pack(anchor="w", pady=(0, 6))
+
+        # 手写板和识别器
+        self.math_canvas = MathCanvasWithRecognizer(
+            math_frame,
+            width=380,
+            height=150,
+            on_result=self._on_math_result,
+            on_error=self._on_math_error,
+        )
+        self.math_canvas.pack(fill=tk.X)
+
+        # 手写板按钮行
+        math_btn_row = ttk.Frame(math_frame, style="Panel.TFrame")
+        math_btn_row.pack(fill=tk.X, pady=(6, 0))
+
+        btn_recognize = ttk.Button(
+            math_btn_row, text="识别公式", style="Accent.TButton",
+            command=self.math_canvas.recognize_async,
+        )
+        btn_recognize.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+        ToolTip(btn_recognize, "识别手写板中的数学公式并计算结果")
+
+        btn_clear_canvas = ttk.Button(
+            math_btn_row, text="清空画布", style="Ghost.TButton",
+            command=self.math_canvas.clear,
+        )
+        btn_clear_canvas.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ToolTip(btn_clear_canvas, "清空手写板")
+
         ttk.Label(left, text="候选（↑↓ 选择，Enter 查看详情）",
                   style="Hint.TLabel").pack(anchor="w", pady=(0, 6))
 
@@ -1655,6 +1691,53 @@ class App(tk.Tk):
         """显式「搜索」按钮：强制模糊模式（即使恰好精确匹配也展示全部候选）。"""
         self._cancel_pending_query()
         self._run_query()
+
+    def _on_math_result(self, latex_str: str, result: dict) -> None:
+        """手写公式识别成功回调"""
+        self._clear_detail()
+
+        card = ttk.Frame(self.detail_inner, style="Card.TFrame", padding=CARD_PADDING)
+        card.pack(fill=tk.X, pady=(0, 10))
+
+        ttk.Label(card, text="识别结果", style="Card.TLabel",
+                  font=("Microsoft YaHei UI", 11, "bold")).pack(anchor="w", pady=(0, 10))
+
+        # LaTeX 表达式
+        row = ttk.Frame(card, style="Card.TFrame")
+        row.pack(fill=tk.X, pady=2)
+        ttk.Label(row, text="LaTeX:", style="Field.TLabel", width=10).pack(side=tk.LEFT)
+        ttk.Label(row, text=latex_str, style="Value.TLabel").pack(side=tk.LEFT)
+
+        # 计算结果
+        if "error" not in result:
+            row = ttk.Frame(card, style="Card.TFrame")
+            row.pack(fill=tk.X, pady=2)
+            ttk.Label(row, text="结果:", style="Field.TLabel", width=10).pack(side=tk.LEFT)
+            ttk.Label(row, text=result["result"], style="Value.TLabel",
+                      foreground=COLOR_ACCENT).pack(side=tk.LEFT)
+
+            # 表达式
+            row = ttk.Frame(card, style="Card.TFrame")
+            row.pack(fill=tk.X, pady=2)
+            ttk.Label(row, text="表达式:", style="Field.TLabel", width=10).pack(side=tk.LEFT)
+            ttk.Label(row, text=result["expr"], style="Value.TLabel").pack(side=tk.LEFT)
+
+            # 复制按钮
+            btn_copy = ttk.Button(
+                card, text="复制 LaTeX", style="ModeSel.TButton",
+                command=lambda: self._copy_to_clipboard(latex_str),
+            )
+            btn_copy.pack(anchor="w", pady=(8, 0))
+        else:
+            row = ttk.Frame(card, style="Card.TFrame")
+            row.pack(fill=tk.X, pady=2)
+            ttk.Label(row, text="错误:", style="Field.TLabel", width=10).pack(side=tk.LEFT)
+            ttk.Label(row, text=result["error"], style="Value.TLabel",
+                      foreground=COLOR_DANGER).pack(side=tk.LEFT)
+
+    def _on_math_error(self, error_msg: str) -> None:
+        """手写公式识别失败回调"""
+        self._toast("识别失败：%s" % error_msg, error=True)
 
     def _on_arrow_up(self, event=None):
         # 如果焦点在输入框，把事件转移给 tree
