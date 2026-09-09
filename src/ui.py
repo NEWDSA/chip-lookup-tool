@@ -145,6 +145,8 @@ def _capacity_display(capacity: str, bit_width: str) -> str:
         return capacity
     gb = density_g / 8
     gb_str = ("%g" % gb) if gb != int(gb) else str(int(gb))
+    if bit_width:
+        return "%s %s (%s GB)" % (capacity, bit_width, gb_str)
     return "%s (%s GB)" % (capacity, gb_str)
 
 
