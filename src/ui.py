@@ -19,7 +19,10 @@ Tkinter UI。结构：
 
 from __future__ import annotations
 
+import argparse
 import copy
+import importlib.util
+import io
 import math
 import os
 import queue
@@ -31,6 +34,8 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Callable, Dict, List, Optional, Tuple
 
 from config import MODE_LABELS, Settings
+from database import default_database_path
+from paths import bundle_root
 from search import cheap_partials, lookup_exact, search, suggest_terms, warm_prepared
 from sources import RecordSource, make_source
 
@@ -609,6 +614,7 @@ class App(tk.Tk):
         }
         self._switch_busy = False          # 是否正在后台构建
         self._switch_token = 0             # 递增令牌，用于忽略过期结果
+        self._sync_token = 0               # 同步任务独立 token（与切换任务隔离）
         self._desired_mode: Optional[str] = None   # 用户最新想切到的模式
         self._pending_force = False        # 下一个切换是否为强制重建（F5 刷新）
         self._switch_queue: "queue.Queue[tuple]" = queue.Queue()
@@ -894,6 +900,16 @@ class App(tk.Tk):
         top = ttk.Frame(self, style="Panel.TFrame", padding=(self._s(14), self._s(8)))
         top.pack(fill=tk.X, side=tk.TOP)
         ttk.Label(top, text="ChipLookup", style="Title.TLabel").pack(side=tk.LEFT)
+        # 同步按钮：头部左侧主操作，紧跟标题（与右侧的极简模式按钮形成对称）。
+        # 用 ModeSel.TButton 紧凑暗灰风格，跟头部其它按钮风格一致；同步
+        # 期间置 disabled 并改文案，主线程不会因 I/O 卡住（脚本走后台线程）。
+        self.btn_sync = ttk.Button(
+            top, text="同步", style="ModeSel.TButton",
+            command=self._on_sync_clicked,
+        )
+        self.btn_sync.pack(side=tk.LEFT, padx=(12, 0))
+        ToolTip(self.btn_sync,
+                "从上游索引（fdnext）拉取最新数据并合并到本地 CSV，仅填空不覆盖已有字段")
         self.status_label = ttk.Label(top, text="", style="Status.TLabel")
         self.status_label.pack(side=tk.LEFT, padx=(24, 0))
         # 常驻文案只放「模式 · 条数」（#8 去重）；数据源完整描述（LABEL · 文件名）
@@ -1455,21 +1471,39 @@ class App(tk.Tk):
         self.after(40, self._poll_switch_queue)
 
     def _poll_switch_queue(self):
-        """主线程轮询后台切换结果并落地（token 校验防串台）。"""
+        """主线程轮询后台任务结果并落地。
+
+        队列上同时跑两类任务：
+            "ok" / "err"            数据源切换（用 _switch_token）
+            "sync_ok" / "sync_err"  上游同步结果（用 _sync_token，独立计数）
+
+        两类任务用不同 token 体系，避免相互过期：同步结果可能在切换
+        数据源（递增 _switch_token）后才到达，但同步的 _sync_token 不
+        受影响。分发按 kind 字段路由到不同处理函数。
+        """
         try:
             while True:
                 item = self._switch_queue.get_nowait()
                 token = item[0]
-                if token != self._switch_token:
-                    continue  # 过期结果（理论上忙碌门控下不会出现）
                 kind = item[1]
-                mode = item[2]
+                if kind in ("ok", "err"):
+                    if token != self._switch_token:
+                        continue  # 过期结果
+                elif kind in ("sync_ok", "sync_err"):
+                    if token != self._sync_token:
+                        continue
                 if kind == "ok":
-                    _, _, _, src, records = item
+                    _, _, mode, src, records = item
                     self._apply_switch_result(token, mode, src, records)
-                else:
-                    _, _, _, exc = item
+                elif kind == "err":
+                    _, _, mode, exc = item
                     self._handle_switch_error(token, mode, exc)
+                elif kind == "sync_ok":
+                    _, _, csv_path, rc, log = item
+                    self._handle_sync_result(token, csv_path, (rc, log), log)
+                elif kind == "sync_err":
+                    _, _, csv_path, exc, _ = item
+                    self._handle_sync_error(token, csv_path, exc)
         except queue.Empty:
             pass
         # 仍在途 → 继续轮询；否则停表
@@ -1513,6 +1547,9 @@ class App(tk.Tk):
             if not changed and self.on_change:
                 self.on_change()
         self._switch_busy = False
+        # 同步按钮复位：数据源切换收尾时一并把同步按钮从禁用态恢复——
+        # 这条路径在「同步成功 → 自动重建数据源」联动场景下是必须的
+        self._set_busy_ui("同步", busy=False)
         # 切换收尾：radio 恢复可用（#12）；若 latest-wins 队列还有新目标，
         # 下一行 _pump_switch 会立刻再次禁用并接力
         self._set_radios_enabled(True)
@@ -1522,7 +1559,7 @@ class App(tk.Tk):
         """后台构建失败：回滚 radio/状态；若用户又点了新模式则直接接力。"""
         self._switch_busy = False
         # 失败收尾：radio 恢复可用（#12），让用户重试或改选其他模式
-        self._set_radios_enabled(True)
+        self._set_busy_ui("同步", busy=False)
         if self._desired_mode is None:
             # 没有更新的目标 → 回滚到当前已加载模式
             self._refresh_source_buttons()
@@ -2980,6 +3017,226 @@ class App(tk.Tk):
         # 丢弃当前模式缓存，确保真正重读磁盘/索引
         self._source_cache.pop(self.settings.mode, None)
         self._request_source_mode(self.settings.mode, force=True)
+
+    # ---------------- 上游数据同步 ----------------
+    # 头部「同步」按钮：从 iTXTech/fdnext 拉取最新标记码索引，按「只填空」规则
+    # 合入本地 CSV（人工数据优先级最高，原值永不被覆盖）。脚本本身只依赖
+    # 标准库（urllib/json/csv），不依赖 Node.js。
+    #
+    # 实现要点：
+    #   1) tools/sync_upstream.py 没 __init__.py，直接用 importlib.util 按文件
+    #      路径加载；路径经 bundle_root() 解析，开发模式与 PyInstaller 打包后
+    #      都能找到（spec 把 tools/ 整目录打进 _MEIPASS/tools/）。
+    #   2) 同步必须放后台线程（脚本涉及网络 I/O + 全表遍历），UI 不能冻结；
+    #      期间复用 _switch_busy 当忙碌门 + 把 radios 禁用，与切换模式共用
+    #      同一套互斥/视觉提示。
+    #   3) run() 内部 print 打到 stdout → 在后台线程里把 sys.stdout 重定向
+    #      到 StringIO，run() 结束后从 StringIO 提取关键统计行（耗时/合并
+    #      条数/审计提示）做 toast 反馈。
+    #   4) 同步成功后：local/hybrid 模式立刻强制重建数据源刷新列表；upstream
+    #      模式只 toast 提示「本地 CSV 已同步，需切到本地/混合才看得到」，
+    #      避免误导（当前模式的 records 是从网络拉来的，跟本地 CSV 无关）。
+
+    def _sync_script_path(self) -> Optional[str]:
+        """定位 tools/sync_upstream.py：开发模式 → 项目根/tools/；
+        PyInstaller 打包后 → _MEIPASS/tools/。"""
+        path = os.path.join(bundle_root(), "tools", "sync_upstream.py")
+        return path if os.path.isfile(path) else None
+
+    def _on_sync_clicked(self):
+        """同步按钮点击：忙碌门控 + 启动后台 worker。"""
+        if self._switch_busy:
+            self._toast("正在执行其他操作，请稍候…")
+            return
+        script = self._sync_script_path()
+        if not script:
+            self._toast("找不到 sync_upstream.py，无法同步", error=True)
+            return
+        # 锁定 UI：复用 _switch_busy 标志（与切换模式共用同一套互斥/提示）
+        self._switch_busy = True
+        self._set_busy_ui("同步中…", busy=True)
+        self._switch_started = time.monotonic()
+        self._start_sync_worker(script)
+
+    def _start_sync_worker(self, script_path: str):
+        """后台线程跑 tools/sync_upstream.run(args)，结果入 _switch_queue
+        复用同一条轮询通道（避免再起一套 after/线程）。"""
+        # sync_upstream.run 期望 args.db 为本地 CSV 路径；脚本默认就是
+        # default_database_path()，这里显式传以便日志与状态栏文案一致。
+        csv_path = default_database_path()
+        # 同步任务用独立 token 计数（与切换数据源任务隔离）
+        self._sync_token += 1
+        token = self._sync_token
+
+        def _run():
+            try:
+                # 用 importlib 按文件路径加载 tools/sync_upstream.py（该
+                # 目录没 __init__.py，普通 import 不可用）
+                spec = importlib.util.spec_from_file_location(
+                    "_sync_upstream_runtime", script_path
+                )
+                if spec is None or spec.loader is None:
+                    raise RuntimeError("无法加载同步脚本: %s" % script_path)
+                mod = importlib.util.module_from_spec(spec)
+                # 把脚本所在目录加入 sys.path，让脚本顶部的「找到 src 包」
+                # 逻辑（sys.path.insert ROOT）能正常完成
+                script_dir = os.path.dirname(script_path)
+                project_root = os.path.dirname(script_dir)
+                path_inserted = False
+                if project_root and project_root not in sys.path:
+                    sys.path.insert(0, project_root)
+                    path_inserted = True
+                try:
+                    spec.loader.exec_module(mod)
+                    args = argparse.Namespace(
+                        db=csv_path,
+                        cache_dir=None,
+                        offline=False,
+                        refresh=False,
+                        max_age=mod.DEFAULT_MAX_AGE_SECONDS,
+                        timeout=mod.DEFAULT_TIMEOUT_SECONDS,
+                        dry_run=False,
+                        verbose=False,
+                        export_index=None,
+                        show_limit=20,
+                    )
+                    # 重定向 stdout → StringIO，捕获 print 输出
+                    buf = io.StringIO()
+                    real_stdout = sys.stdout
+                    sys.stdout = buf
+                    try:
+                        rc = mod.run(args)
+                    finally:
+                        sys.stdout = real_stdout
+                    log = buf.getvalue()
+                finally:
+                    if path_inserted:
+                        try:
+                            sys.path.remove(project_root)
+                        except ValueError:
+                            pass
+                self._switch_queue.put(
+                    (token, "sync_ok", csv_path, rc, log)
+                )
+            except Exception as exc:
+                self._switch_queue.put(
+                    (token, "sync_err", csv_path, exc, "")
+                )
+
+        threading.Thread(
+            target=_run, daemon=True, name="chiplookup-sync-upstream"
+        ).start()
+        self._ensure_polling()
+
+    def _handle_sync_result(self, token: int, csv_path: str,
+                            payload, log: str):
+        """同步成功回调：toast 反馈 + 必要的数据源刷新。
+
+        UI 收尾策略按当前模式分两支：
+            - local / hybrid：调 _request_source_mode(force=True) 重建数据
+              源，最后由 _apply_switch_result 一并把按钮 / radio / busy
+              复位（统一收尾，避免分散在两条路径里漏掉）。
+            - upstream / 失败：本地 CSV 跟当前网络视图无关 或 同步失败，
+              直接 _finalize_sync_only() 主动复位 UI。
+        """
+        # 解包：rc == 0 视为成功，非 0 视为失败（脚本约定）
+        rc, log_text = payload if isinstance(payload, tuple) else (payload, log)
+        elapsed = self._switch_elapsed()
+        stats = _parse_sync_log(log_text)
+        if rc == 0:
+            # 构造 toast 文案：耗时 + 关键统计；网络降级用旧缓存时也提示
+            parts = []
+            if stats["filled_model"] is not None:
+                parts.append("补 model %d 条" % stats["filled_model"])
+            if stats["filled_manufacturer"] is not None:
+                parts.append("manufacturer %d 条" % stats["filled_manufacturer"])
+            if stats["changed"] is not None:
+                parts.append("已合并 %d 条" % stats["changed"])
+            elif stats.get("stale_cache"):
+                parts.append("网络失败已降级用旧缓存")
+            detail = " · ".join(parts) if parts else "无新数据可补"
+            self._toast("同步完成 · %s · %.1fs" % (detail, elapsed))
+            # local / hybrid 模式：本地 CSV 已变化，强制重建数据源刷新列表
+            if self.settings.mode in ("local", "hybrid"):
+                self._source_cache.pop(self.settings.mode, None)
+                # 先释放同步阶段的忙碌锁，否则 _pump_switch 会因
+                # _switch_busy=True 直接跳过，数据源重建永远不启动
+                self._switch_busy = False
+                self._request_source_mode(self.settings.mode, force=True)
+                # _request_source_mode → _pump_switch 会重新加锁并
+                # 在 _apply_switch_result 收尾时恢复按钮/radio
+                return
+            # upstream 模式：本地 CSV 变化跟当前网络视图无关，仅提示用户
+            self._toast("当前是「网络」模式，切回「本地CSV」或「混合」可看到新数据")
+        else:
+            self._toast("同步失败：返回码 %d · %.1fs" % (rc, elapsed), error=True)
+        # upstream 模式 / 非 0 返回码：没有触发数据源重建，主动复位 UI
+        self._finalize_sync_only()
+
+    def _handle_sync_error(self, token: int, csv_path: str, exc: Exception):
+        """同步失败回调：错误 toast，恢复 UI 状态。"""
+        elapsed = self._switch_elapsed()
+        self._toast("同步失败：%s · %.1fs" % (exc, elapsed), error=True)
+        # 没有触发数据源重建，主动复位 UI
+        self._finalize_sync_only()
+
+    # ---------------- 同步结束后 UI 收尾（在 _apply_switch_result 风格的
+    # 数据源切换收尾里复用，本方法单独处理「只跑同步、不重建数据源」
+    # 的分支，如 upstream 模式同步、或同步失败场景） ----------------
+
+    def _finalize_sync_only(self):
+        """同步跑完但不需要重建数据源时（upstream 模式 / 失败），
+        主动清掉忙碌门 + 恢复按钮/radio。"""
+        self._switch_busy = False
+        self._set_busy_ui("同步", busy=False)
+        # 切换队列里还有 latest-wins 目标？接力跑
+        self._pump_switch()
+
+    def _set_busy_ui(self, sync_label: str, busy: bool):
+        """统一处理「后台任务期间」的 UI 状态：同步按钮 + radio。
+
+        busy=True  → 同步按钮 disabled 并显示给定文案，radio 禁用；
+        busy=False → 全部恢复。
+
+        数据源切换时由 _pump_switch 单独管 radio 启停（#12），这里只动
+        同步按钮；切换收尾时也会调本方法，把同步按钮一并复位，避免
+        「同步成功后切模式重置数据源」这种联动场景把按钮卡在禁用态。
+        """
+        try:
+            self.btn_sync.state(["disabled"] if busy else ["!disabled"])
+        except tk.TclError:
+            pass
+        self.btn_sync.configure(text=sync_label)
+        self._set_radios_enabled(not busy)
+
+
+def _parse_sync_log(log: str) -> dict:
+    """从 sync_upstream.run() 的 print 输出里提取关键统计。
+
+    脚本约定的可识别行（任何一项缺失都返回 None，按钮反馈照样能渲染）：
+        [sync] 本地记录 N 条；本次可补: model X 条 / manufacturer Y 条
+        [sync] 已合并 N 条并写回 <path>
+        [sync] 无可填空字段，未写盘（保持不变）。
+        ...（含 "下载失败...降级" 时表示 stale_cache）
+    """
+    import re as _re
+
+    out: dict = {
+        "filled_model": None,
+        "filled_manufacturer": None,
+        "changed": None,
+        "stale_cache": False,
+    }
+    m = _re.search(r"本次可补:\s*model\s+(\d+)\s*条\s*/\s*manufacturer\s+(\d+)\s*条", log)
+    if m:
+        out["filled_model"] = int(m.group(1))
+        out["filled_manufacturer"] = int(m.group(2))
+    m = _re.search(r"已合并\s+(\d+)\s*条并写回", log)
+    if m:
+        out["changed"] = int(m.group(1))
+    if "下载失败" in log and "降级" in log:
+        out["stale_cache"] = True
+    return out
 
 
 def run(settings: Settings, source: RecordSource,
