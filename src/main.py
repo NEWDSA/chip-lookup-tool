@@ -68,7 +68,28 @@ def _parse_args():
     return parser.parse_args()
 
 
+def _enable_dpi_awareness():
+    """Windows 高分屏 DPI 感知：让进程按真实 DPI 渲染，避免被系统位图拉伸发虚。
+
+    必须在创建 Tk 窗口之前调用。逐级尝试：
+      1. SetProcessDpiAwareness(1)  —— Win 8.1+（system DPI aware）
+      2. SetProcessDPIAware()       —— Vista~Win8 回退
+    非 Windows / 已设置过 / 调用失败一律静默忽略（不影响启动）。
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+
 def main() -> int:
+    _enable_dpi_awareness()
     args = _parse_args()
     settings = build_settings(args)
 

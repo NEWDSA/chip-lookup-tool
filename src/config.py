@@ -139,6 +139,10 @@ class Settings:
     csv_path: Optional[str] = None
     # 混合模式优先级
     hybrid_priority: str = HYBRID_LOCAL_FIRST
+    # UI 布局：极简模式（隐藏右栏详情区，仅显示左侧查询列表）
+    minimal_mode: bool = False
+    # 主窗口尺寸记忆（"宽x高"，如 "1150x780"；None=从未手动调整过，用默认尺寸）
+    window_size: Optional[str] = None
     # 网络类型参数（原「上游」类型；键名保持 upstream_* 兼容既有配置）
     upstream_offline: bool = False
     upstream_refresh: bool = False
@@ -156,7 +160,7 @@ class Settings:
 
     # 通用运行参数 + 网络类型参数（键名与 NETWORK_PARAMS 一致，兼容历史配置）
     _SERIALIZED = (
-        "mode", "csv_path", "hybrid_priority",
+        "mode", "csv_path", "hybrid_priority", "minimal_mode", "window_size",
     ) + NETWORK_PARAMS
 
     def to_dict(self) -> dict:
@@ -202,10 +206,22 @@ class Settings:
             self.upstream_timeout = DEFAULT_UPSTREAM_TIMEOUT
         if self.upstream_rate_limit < 0:
             self.upstream_rate_limit = DEFAULT_UPSTREAM_RATE_LIMIT
+        if self.window_size is not None:
+            ok = False
+            try:
+                w, h = str(self.window_size).lower().split("x", 1)
+                ok = int(w) > 0 and int(h) > 0
+            except (ValueError, AttributeError):
+                ok = False
+            if not ok:
+                self.warnings.append(
+                    "窗口尺寸 %r 无效，已忽略" % (self.window_size,)
+                )
+                self.window_size = None
 
     @staticmethod
     def _coerce(key: str, value) -> object:
-        if key in ("upstream_offline", "upstream_refresh"):
+        if key in ("upstream_offline", "upstream_refresh", "minimal_mode"):
             if isinstance(value, bool):
                 return value
             return str(value).strip().lower() in ("1", "true", "yes", "on")
@@ -217,6 +233,8 @@ class Settings:
         if key == "upstream_cache_dir":
             return str(value or "") or None
         if key == "csv_path":
+            return str(value or "") or None
+        if key == "window_size":
             return str(value or "") or None
         return str(value)
 

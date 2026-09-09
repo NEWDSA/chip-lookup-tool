@@ -23,7 +23,9 @@ import copy
 import math
 import os
 import queue
+import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from typing import Callable, Dict, List, Optional, Tuple
@@ -147,11 +149,41 @@ def _hex_to_rgb(value: str) -> Tuple[int, int, int]:
 _BG_RGB = _hex_to_rgb(COLOR_BG)
 
 
+def _win_dpi_scale() -> float:
+    """Windows 真实系统 DPI / 96；非 Windows 或探测失败返回 0（调用方自行回退）。
+
+    DPI 感知进程拿到真实 DPI（125% → 1.25）；未感知进程被系统虚拟化返回 96
+    → 恒 1.0。不要用 winfo_fpixels('1i') 推导——它由字体度量计算（实测
+    96.09/96），会引入 ~1% 漂移。
+    """
+    if sys.platform != "win32":
+        return 0.0
+    try:
+        import ctypes
+        dpi = 0
+        try:
+            dpi = int(ctypes.windll.user32.GetDpiForSystem())
+        except Exception:
+            pass
+        if dpi <= 0:
+            hdc = ctypes.windll.user32.GetDC(0)
+            try:
+                dpi = int(ctypes.windll.gdi32.GetDeviceCaps(hdc, 88))  # LOGPIXELSX
+            finally:
+                ctypes.windll.user32.ReleaseDC(0, hdc)
+        if dpi > 0:
+            return dpi / 96.0
+    except Exception:
+        pass
+    return 0.0
+
+
 class SlimVScrollbar(tk.Canvas):
     """右侧详情区的自绘细条竖向滚动条（替代 clam 主题默认 ttk.Scrollbar）。
 
     设计要点（对应视觉优化需求）：
-    1. 纤细化：命中区仅 11px，视觉条宽 6px，去掉了原生粗大的上下箭头按钮；
+    1. 纤细但易点：命中区 16px（#6 扩大点击目标，原 11px 太窄难点中），
+       视觉条宽 6px 居中绘制，去掉了原生粗大的上下箭头按钮；
     2. 长度准确：滑块高度只由 canvas 回报的 (first,last) 比例换算，有多少
        可滚动范围就显示多长；内容不溢出时被 _sync_detail_scrollbar 整体
        卸载，从根上杜绝“整条轨道占满的无效滑块”；
@@ -163,8 +195,8 @@ class SlimVScrollbar(tk.Canvas):
     COLOR_BG 底色的区域上使用。
     """
 
-    WIDTH = 11            # 命中区宽度（整条都响应悬停/点击，保证可点性）
-    BAR_W = 6.0           # 视觉条宽（纤细）
+    WIDTH = 16            # 命中区宽度（整条都响应悬停/点击；#6 扩大点击目标）
+    BAR_W = 6.0           # 视觉条宽（纤细，命中区内居中绘制）
     INSET_Y = 3           # 视觉条相对控件顶/底的留白
     MIN_THUMB = 24        # 滑块最短像素（保证可抓取）
     RADIUS = 3.0          # 圆角半径（≈ 半条宽 → 胶囊形）
@@ -177,6 +209,21 @@ class SlimVScrollbar(tk.Canvas):
             master, width=self.WIDTH, bg=COLOR_BG,
             highlightthickness=0, bd=0, relief="flat", cursor="arrow",
         )
+        # DPI 缩放：像素常量按显示器 DPI 放大（类常量保留 96 DPI 逻辑值）。
+        # winfo_fpixels 需控件已创建，故先按类值构造、再改写并 configure 宽度。
+        sc = _win_dpi_scale()
+        if sc <= 0:
+            try:
+                sc = round(float(self.winfo_fpixels("1i")) / 96.0 * 40) / 40.0
+            except Exception:
+                sc = 1.0
+        if abs(sc - 1.0) > 0.01:
+            self.WIDTH = max(7, int(round(self.WIDTH * sc)))
+            self.BAR_W = max(4.0, self.BAR_W * sc)
+            self.RADIUS = self.BAR_W / 2.0
+            self.INSET_Y = max(2, int(round(self.INSET_Y * sc)))
+            self.MIN_THUMB = max(16, int(round(self.MIN_THUMB * sc)))
+            self.configure(width=self.WIDTH)
         self._cmd = command
         self._first = 0.0
         self._last = 1.0
@@ -193,7 +240,9 @@ class SlimVScrollbar(tk.Canvas):
         self._thumb_key: Optional[Tuple[int, int]] = None
         self._cursor_now = "arrow"
 
-        self._blank_photo = tk.PhotoImage(width=1, height=1)
+        # master 必须显式指定：PhotoImage 不带 master 会挂到“默认根”（首个 Tk），
+        # 同进程创建第二个 App 时图像属于旧解释器，触发 "pyimageN doesn't exist"
+        self._blank_photo = tk.PhotoImage(master=self, width=1, height=1)
         # 两层自绘图层：轨道在下、滑块在上
         self._track_item = self.create_image(0, 0, anchor="nw", image=self._blank_photo)
         self._thumb_item = self.create_image(0, 0, anchor="nw", image=self._blank_photo)
@@ -381,18 +430,155 @@ class SlimVScrollbar(tk.Canvas):
         self._on_enter(None)
 
 
+# ---------------- 轻量悬停提示 ----------------
+
+def _create_tip_window(master: tk.Widget, text: str) -> tk.Toplevel:
+    """构造无边框深色提示气泡（ToolTip 与候选行级提示共用样式）。"""
+    tip = tk.Toplevel(master)
+    tip.wm_overrideredirect(True)   # 无边框、不进任务栏
+    try:
+        tip.attributes("-topmost", True)
+    except tk.TclError:
+        pass
+    tk.Label(
+        tip, text=text, justify=tk.LEFT, anchor="w",
+        bg=COLOR_CARD, fg=COLOR_TEXT,
+        highlightthickness=1, highlightbackground=COLOR_BORDER,
+        padx=8, pady=5,
+        font=(FONT_FAMILY_UI, 9),
+    ).pack(fill="both", expand=True)
+    return tip
+
+
+def _place_tip_window(tip: Optional[tk.Toplevel]):
+    """气泡定位在指针右下方；右/下贴边时往屏内收（#7 屏幕边缘收敛）。"""
+    if tip is None:
+        return
+    try:
+        tip.update_idletasks()
+        w, h = tip.winfo_reqwidth(), tip.winfo_reqheight()
+        px = tip.winfo_pointerx() + 14
+        py = tip.winfo_pointery() + 20
+        sw, sh = tip.winfo_screenwidth(), tip.winfo_screenheight()
+        x = max(0, min(px, sw - w - 8))
+        y = max(0, min(py, sh - h - 8))
+        tip.wm_geometry("+%d+%d" % (x, y))
+    except tk.TclError:
+        pass
+
+
+class ToolTip:
+    """轻量悬停提示：深色小气泡，600ms 防抖弹出。
+
+    - 停留 600ms 才出现（快速划过不弹），移开/按下立即消失；
+    - 显示位置在指针右下，贴屏幕边缘自动收回（见 _place_tip_window）；
+    - `update_text` 支持动态改文案（如状态栏的当前数据源描述）。
+
+    实例无需外部保活：tkinter 的 bind 会持有回调对象，控件存续期间
+    ToolTip 一直可达；控件销毁时 <Destroy> 回调清场。
+    """
+
+    DELAY_MS = 600   # 防抖：停留超过此时长才弹出
+
+    def __init__(self, widget: tk.Widget, text: str = ""):
+        self._widget = widget
+        self._text = text
+        self._after_id: Optional[str] = None
+        self._tip: Optional[tk.Toplevel] = None
+        self._tip_label: Optional[tk.Label] = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+        widget.bind("<Destroy>", self._on_destroy, add="+")
+
+    def update_text(self, text: str):
+        """动态更新文案；气泡正在显示时立即生效。"""
+        self._text = text
+        if self._tip is not None:
+            try:
+                self._tip_label.configure(text=text)
+                _place_tip_window(self._tip)
+            except tk.TclError:
+                pass
+
+    # ---------- 内部 ----------
+    def _schedule(self, _event=None):
+        self._cancel()
+        self._after_id = self._widget.after(self.DELAY_MS, self._show)
+
+    def _hide(self, _event=None):
+        self._cancel()
+        if self._tip is not None:
+            try:
+                self._tip.destroy()
+            except tk.TclError:
+                pass
+            self._tip = None
+            self._tip_label = None
+
+    def _cancel(self):
+        if self._after_id is not None:
+            try:
+                self._widget.after_cancel(self._after_id)
+            except Exception:
+                pass
+            self._after_id = None
+
+    def _on_destroy(self, _event=None):
+        # 控件销毁（含 App 关闭）时清掉挂起的 after 与气泡，防止关闭期报错
+        self._hide()
+
+    def _show(self):
+        self._after_id = None
+        try:
+            if not self._text or not self._widget.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        if self._tip is not None:
+            return
+        self._tip = _create_tip_window(self._widget, self._text)
+        self._tip_label = self._tip.winfo_children()[0]
+        _place_tip_window(self._tip)
+
+
+# 数据源模式悬停说明（#7 tooltip 体系）：radio 上只放得下短标签，差异在这里说清
+_SOURCE_MODE_HINTS = {
+    "local": "读取本地 CSV 文件，离线可用",
+    "upstream": "从上游网络接口拉取数据（需联网，首次构建较慢）",
+    "hybrid": "本地 + 网络合并查询（首次构建较慢）",
+}
+
+
 # ---------------- 主窗口 ----------------
 
 class App(tk.Tk):
     def __init__(self, settings: Settings, source: RecordSource,
                  on_change: Optional[Callable[[], None]] = None):
         super().__init__()
+        # DPI 缩放因子（必须先于任何像素尺寸计算）：winfo_fpixels('1i') 返回
+        # 当前显示器真实 DPI（进程开启 DPI 感知后，125% 缩放 → 120），除以 96
+        # 得缩放系数。像素类常量（窗口尺寸/行高/列宽等）经 _s() 缩放，保证高分
+        # 屏下布局比例与 96 DPI 一致（字体是 pt 单位，Tk 按 scaling 自动缩放）。
+        self._ui_scale = self._compute_ui_scale()
         self.title("ChipLookup · 芯片料号查询器")
-        self.geometry("1200x860")
-        self.minsize(1000, 680)
+        self.minsize(self._s(1000), self._s(680))
         self.configure(bg=COLOR_BG)
 
+        # 窗口尺寸记忆状态（见 _on_window_configure / _save_window_size）
+        self._win_size_ready: bool = False         # 启动就绪前忽略尺寸事件（程序性变化）
+        self._win_size_save_after: Optional[str] = None  # 尺寸防抖保存句柄
+        self._last_saved_win_size: Optional[Tuple[int, int]] = None  # 上次已保存尺寸（去重）
+        # 左栏右缘 grid padx（逻辑 7px）：_apply_pane_width 计算列 minsize 时需一并计入，
+        # 实例属性按 DPI 缩放（类常量保留逻辑值便于追溯）
+        self._LEFT_PADX = self._s(self._LEFT_PADX)
+        # 状态栏 toast / 紧凑文案状态（见 _toast / _refresh_status）
+        self._toast_after: Optional[str] = None   # toast 到期恢复回调句柄（连续 toast 防抖）
+        self._status_compact: bool = False        # 状态栏当前是否为窄窗紧凑文案
+
         self.settings = settings
+        # 初始尺寸：优先恢复用户上次手动调整并保存的大小，否则用默认尺寸
+        self.geometry("%dx%d" % self._initial_window_size())
         self.source = source
         self.on_change = on_change
         self._records_cache = self.source.list_records()
@@ -417,6 +603,7 @@ class App(tk.Tk):
         self._switch_queue: "queue.Queue[tuple]" = queue.Queue()
         self._polling = False              # 队列轮询是否已挂起
         self._source_radios: List[ttk.Radiobutton] = []
+        self._switch_started: Optional[float] = None  # 当前切换开始时刻（耗时 toast 用，#12）
         # 输入防抖：连续敲键只触发最后一次查询（上游 4 万条时省去中间全量扫描）
         self._query_after_id: Optional[str] = None
 
@@ -433,8 +620,16 @@ class App(tk.Tk):
         self._left_pane_w: Optional[int] = None    # 左栏宽度（像素，None=尚未初始化）
         self._pane_custom: bool = False            # 用户是否拖过左右分隔条（拖过则不再随窗口比例变化）
         self._pane_drag: Optional[Tuple[int, int]] = None  # (拖动起始 x_root, 起始左栏宽)
+        self._pane_repin_after: Optional[str] = None  # 左栏宽度 after_idle 复钉句柄（防抖）
+        self._minimal_mode: bool = False           # 极简模式：右栏详情区整体隐藏
+        self._minimal_anim_after: Optional[str] = None  # 极简布局动画 after 句柄（防重入）
+        self._minimal_saved_w: Optional[int] = None  # 进极简前的左栏宽（出极简时恢复）
         self._col_drag: Optional[Tuple[int, int]] = None   # (被拖分隔线左侧列下标, 拖动起始 x_root)
         self._col_drag_widths: Optional[Tuple[int, ...]] = None  # 拖动起点各列宽（拖动基准）
+        # 候选行级悬停提示状态（见 _on_tree_tip_motion）
+        self._tree_tip: Optional[tk.Toplevel] = None      # 行信息气泡（完整料号/厂商/容量）
+        self._tree_tip_after: Optional[str] = None        # 行级提示 600ms 防抖句柄
+        self._tree_tip_row: Optional[str] = None          # 气泡当前对应的行 iid（换行即重置）
 
         self._configure_style()
         self._build_layout()
@@ -444,8 +639,33 @@ class App(tk.Tk):
         self._refresh_source_buttons()  # 初始化数据源 radio 选中态（回填已保存模式）
         # 窗口首帧布局稳定后，按内容高度决定详情滚动条是否出现
         self._schedule_scroll_sync()
+        # 恢复上次的极简模式偏好（延后一帧等首帧布局稳定；启动不做动画）
+        if self.settings.minimal_mode:
+            self.after(80, lambda: self._set_minimal_mode(True, animate=False))
+        # 窗口尺寸记忆：布局稳定后才跟踪（启动期间的程序性尺寸变化不保存）
+        self.bind("<Configure>", self._on_window_configure)
+        self.after(600, self._enable_win_size_tracking)
 
     # ---------------- 样式 ----------------
+
+    def _compute_ui_scale(self) -> float:
+        """DPI 缩放因子 = 真实系统 DPI / 96（探测见 _win_dpi_scale）。
+
+        Windows 优先走系统 API；非 Windows 或 API 不可用时回退 fpixels，
+        并按 2.5% 步长吸附消除字体度量带来的 ~1% 漂移。
+        """
+        f = _win_dpi_scale()
+        if f > 0:
+            return f
+        try:
+            f = float(self.winfo_fpixels("1i")) / 96.0
+            return round(f * 40) / 40.0
+        except Exception:
+            return 1.0
+
+    def _s(self, px) -> int:
+        """逻辑像素 → 物理像素（按显示器 DPI 缩放，见 _compute_ui_scale）。"""
+        return int(round(px * self._ui_scale))
 
     def _configure_style(self):
         style = ttk.Style(self)
@@ -481,14 +701,23 @@ class App(tk.Tk):
             padding=(10, 8),
             font=("Consolas", 12),
         )
+        # 输入框聚焦态（#4 焦点可见）：边框/内亮线变亮蓝，与按钮焦点环同色系
+        style.map(
+            "Search.TEntry",
+            bordercolor=[("focus", COLOR_FOCUS)],
+            lightcolor=[("focus", COLOR_FOCUS)],
+        )
 
         # 按钮
+        # 键盘焦点可见（#4）：focusthickness 1 + 亮蓝 focuscolor，Tab 遍历时能
+        # 看清焦点在哪个按钮上（原 focusthickness=0 连键盘用户都看不到焦点）
         style.configure(
             "Accent.TButton",
             background=COLOR_ACCENT,
             foreground="#0e1620",
             borderwidth=0,
-            focusthickness=0,
+            focusthickness=1,
+            focuscolor=COLOR_FOCUS,
             padding=BTN_PADDING_LG,
             font=(FONT_FAMILY_UI, FONT_SIZE_SM, "bold"),
         )
@@ -497,20 +726,30 @@ class App(tk.Tk):
         style.configure(
             "Blue.TButton",
             background=COLOR_ACCENT2,
-            foreground="#ffffff",
+            # 深字 #0e1620 on #4a90e0 = 5.6:1（WCAG AA 达标；原白字仅 3.3:1），
+            # 与 Accent 绿钮的「亮底 + 深字」设计语言保持一致
+            foreground="#0e1620",
             borderwidth=0,
-            focusthickness=0,
+            focusthickness=1,
+            focuscolor=COLOR_FOCUS,
             padding=BTN_PADDING_LG,
             font=(FONT_FAMILY_UI, FONT_SIZE_SM, "bold"),
         )
-        style.map("Blue.TButton", background=[("active", "#2563eb"), ("disabled", "#3b4862")])
+        # 对比度逐态核对：active 深字 on #6aa9ec = 7.5:1 ✓；disabled #b0c4d4
+        # on #3b4862 = 5.1:1 ✓（disabled 底色偏深，必须单映射浅字，深字仅 2:1）
+        style.map(
+            "Blue.TButton",
+            background=[("active", "#6aa9ec"), ("disabled", "#3b4862")],
+            foreground=[("disabled", "#b0c4d4")],
+        )
 
         style.configure(
             "Ghost.TButton",
             background=COLOR_PANEL,
             foreground=COLOR_TEXT,
             borderwidth=0,
-            focusthickness=0,
+            focusthickness=1,
+            focuscolor=COLOR_FOCUS,
             padding=BTN_PADDING_MD,
             font=(FONT_FAMILY_UI, FONT_SIZE_SM),
         )
@@ -522,7 +761,8 @@ class App(tk.Tk):
             background=COLOR_BORDER,
             foreground=COLOR_TEXT,
             borderwidth=0,
-            focusthickness=0,
+            focusthickness=1,
+            focuscolor=COLOR_FOCUS,
             padding=BTN_PADDING_SM,
             font=(FONT_FAMILY_UI, FONT_SIZE_XS),
         )
@@ -532,7 +772,8 @@ class App(tk.Tk):
             background=COLOR_ACCENT,
             foreground="#0e1620",
             borderwidth=0,
-            focusthickness=0,
+            focusthickness=1,
+            focuscolor=COLOR_FOCUS,
             padding=BTN_PADDING_SM,
             font=(FONT_FAMILY_UI, FONT_SIZE_XS, "bold"),
         )
@@ -553,7 +794,11 @@ class App(tk.Tk):
         style.map(
             "ModeRadio.TRadiobutton",
             background=[("selected", COLOR_ACCENT), ("active", "#3a4d63")],
-            foreground=[("selected", "#0e1620"), ("active", COLOR_TEXT)],
+            foreground=[
+                ("selected", "#0e1620"),
+                ("active", COLOR_TEXT),
+                ("disabled", "#66788c"),   # 切换忙碌期间禁用态置灰（#12）
+            ],
         )
         # 彻底移除 Radiobutton 的 focus 内边距/边框元素，消除选中时的虚线外框
         style.layout("ModeRadio.TRadiobutton", [
@@ -571,15 +816,34 @@ class App(tk.Tk):
             fieldbackground=COLOR_PANEL,
             foreground=COLOR_TEXT,
             borderwidth=0,
-            rowheight=32,
+            rowheight=self._s(32),  # 逻辑 32px：随 DPI 缩放，保证行高与字体的比例恒定
             font=("Microsoft YaHei UI", 10),
         )
+        # 原生的 ttk.Treeview.Heading 在不同主题下对垂直 sticky 支持不一致，
+        # 导致表头文字无法可靠地在单元格内垂直居中。这里把 heading 行压缩到
+        # 接近 0 高度并留空，实际表头由上方自定义的 tk.Frame + Label 实现，
+        # 从而完全控制表头高度、padding 和对齐。
         style.configure(
             "Candidate.Treeview.Heading",
             background=COLOR_PANEL,
-            foreground=COLOR_TEXT_DIM,
+            foreground=COLOR_PANEL,
             borderwidth=0,
-            font=("Microsoft YaHei UI", 10, "bold"),
+            anchor="center",
+            padding=(0, 0),
+            font=("Microsoft YaHei UI", 1),
+            relief="flat",
+        )
+        style.layout(
+            "Candidate.Treeview.Heading",
+            [
+                ("Treeheading.cell", {"sticky": "nswe"}),
+                ("Treeheading.padding", {
+                    "sticky": "nswe",
+                    "children": [
+                        ("Treeheading.text", {"sticky": "nsew"}),
+                    ],
+                }),
+            ]
         )
         style.map(
             "Candidate.Treeview",
@@ -612,11 +876,14 @@ class App(tk.Tk):
 
     def _build_layout(self):
         # 顶部状态栏
-        top = ttk.Frame(self, style="Panel.TFrame", padding=(14, 8))
+        top = ttk.Frame(self, style="Panel.TFrame", padding=(self._s(14), self._s(8)))
         top.pack(fill=tk.X, side=tk.TOP)
         ttk.Label(top, text="ChipLookup", style="Title.TLabel").pack(side=tk.LEFT)
         self.status_label = ttk.Label(top, text="", style="Status.TLabel")
         self.status_label.pack(side=tk.LEFT, padx=(24, 0))
+        # 常驻文案只放「模式 · 条数」（#8 去重）；数据源完整描述（LABEL · 文件名）
+        # 悬停查看，文案由 _refresh_status 动态更新
+        self._status_tooltip = ToolTip(self.status_label)
 
         # 数据源模式选择（radio 单选组：本地CSV / 网络 / 混合）
         # 互斥由共享变量 var_source_mode 自动保证，仅能选中一项；切换后写回配置文件
@@ -635,9 +902,19 @@ class App(tk.Tk):
             )
             rb.pack(side=tk.LEFT, padx=(0, 2))
             self._source_radios.append(rb)
+            # 悬停说明各模式差异（#7）：radio 上只放得下短标签
+            ToolTip(rb, _SOURCE_MODE_HINTS.get(key, ""))
+
+        # 极简模式切换：隐藏右栏详情区，把空间让给左侧查询列表（偏好写入配置文件）
+        self.btn_minimal = ttk.Button(
+            top, text="极简模式", style="ModeSel.TButton",
+            command=self._toggle_minimal_mode,
+        )
+        self.btn_minimal.pack(side=tk.RIGHT, padx=(0, 10))
+        ToolTip(self.btn_minimal, "隐藏右侧详情区，把空间让给查询列表（Esc 退出）")
 
         # 主体（左右两栏 + 可拖分隔条）
-        body = ttk.Frame(self, style="TFrame", padding=(14, 0))
+        body = ttk.Frame(self, style="TFrame", padding=(self._s(14), 0))
         body.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
         self.body = body
 
@@ -650,10 +927,10 @@ class App(tk.Tk):
         body.bind("<Configure>", self._on_body_configure)
 
         # 左栏
-        left = ttk.Frame(body, style="Panel.TFrame", padding=(12, 12))
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, 7))
-        left.configure(width=300)  # 先占位，首帧由 body Configure 校正
-        body.columnconfigure(0, minsize=300)
+        left = ttk.Frame(body, style="Panel.TFrame", padding=(self._s(12), self._s(12)))
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, self._LEFT_PADX))
+        left.configure(width=self._s(300))  # 先占位，首帧由 body Configure 校正
+        body.columnconfigure(0, minsize=self._s(300))
         self.left = left
 
         ttk.Label(left, text="查询输入", style="Panel.TLabel",
@@ -668,16 +945,20 @@ class App(tk.Tk):
         entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.entry = entry
         entry.bind("<Return>", lambda e: self._on_enter())
-        entry.bind("<Escape>", lambda e: self._clear_query())
+        entry.bind("<Escape>", self._on_escape)
+        ToolTip(entry, "输入料号关键词实时搜索（↑↓ 选择，Enter 查看详情）")
 
         # 按钮行
         btn_row = ttk.Frame(left, style="Panel.TFrame")
         btn_row.pack(fill=tk.X, pady=(0, 12))
-        ttk.Button(btn_row, text="解析料号", style="Accent.TButton",
-                   command=self._on_enter).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+        btn_parse = ttk.Button(btn_row, text="解析料号", style="Accent.TButton",
+                               command=self._on_enter)
+        btn_parse.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+        ToolTip(btn_parse, "按编码规则解析料号字符串，显示各字段含义")
         self.btn_fuzzy = ttk.Button(btn_row, text="搜索", style="Blue.TButton",
                                     command=self._on_fuzzy)
         self.btn_fuzzy.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
+        ToolTip(self.btn_fuzzy, "在当前数据源中模糊搜索（回车同效）")
 
         ttk.Label(left, text="候选（↑↓ 选择，Enter 查看详情）",
                   style="Hint.TLabel").pack(anchor="w", pady=(0, 6))
@@ -713,12 +994,23 @@ class App(tk.Tk):
         self.pager_frame = ttk.Frame(tree_box, style="Panel.TFrame")
         self.pager_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(6, 0))
 
-        # 候选列表（高度 = PAGE_SIZE 行，限制候选区过高）
-        cols = self._TREE_COLS
-        self.tree = ttk.Treeview(
-            tree_box, columns=cols, show="headings", height=self.PAGE_SIZE,
-            style="Candidate.Treeview", selectmode="browse",
+        # 自定义表头：ttk.Treeview 的 heading 行垂直对齐不可靠，用 tk.Label
+        # 自己实现，确保文字在固定高度内完美垂直居中；列宽拖动/左栏缩放时
+        # 通过 _sync_header_labels 与 tree 列宽保持像素级同步。
+        self._HEADER_HEIGHT = self._s(32)
+        # Treeview 单元格文字的固定水平内边距 + 树内容区左边框：
+        # 表头文字必须补偿这两项才能与下方单元格文字左缘对齐（实测校准值：
+        # pad=6 时左锚定列整体偏右 2px，故取 4）
+        self._CELL_TEXT_PADX = 4
+        self.header_frame = tk.Frame(
+            tree_box, bg=COLOR_PANEL, height=self._HEADER_HEIGHT,
+            highlightthickness=0, bd=0,
         )
+        self.header_frame.pack(side=tk.TOP, fill=tk.X)
+        self.header_frame.pack_propagate(False)
+        self._header_labels: Dict[str, tk.Label] = {}
+        self._header_anchor: Dict[str, str] = {}
+        header_font = ("Microsoft YaHei UI", 10, "bold")
         for c, w, anchor in [
             ("part_number", 110, "w"),
             ("model", 200, "w"),
@@ -726,14 +1018,50 @@ class App(tk.Tk):
             ("capacity", 130, "center"),
             ("type", 80, "center"),
         ]:
-            self.tree.heading(c, text={
-                "part_number": "料号", "model": "型号", "manufacturer": "厂商",
-                "capacity": "容量", "type": "类型",
-            }[c])
+            lbl = tk.Label(
+                self.header_frame,
+                text={
+                    "part_number": "料号", "model": "型号", "manufacturer": "厂商",
+                    "capacity": "容量", "type": "类型",
+                }[c],
+                bg=COLOR_PANEL,
+                fg=COLOR_TEXT_DIM,
+                font=header_font,
+                anchor=anchor,
+                bd=0,
+                padx=0,  # tk.Label 默认 padx=1，会让文字整体右偏 1px
+                highlightthickness=0,
+            )
+            lbl.bind("<Motion>", self._on_tree_motion)
+            lbl.bind("<ButtonPress-1>", self._on_tree_press)
+            self._header_labels[c] = lbl
+            self._header_anchor[c] = anchor
+        # header_frame 本身也捕获事件（鼠标在 label 间隙时）
+        self.header_frame.bind("<Motion>", self._on_tree_motion)
+        self.header_frame.bind("<ButtonPress-1>", self._on_tree_press)
+        self.header_frame.bind("<Leave>", self._on_tree_leave)
+
+        # 候选列表（高度 = PAGE_SIZE 行，限制候选区过高）
+        cols = self._TREE_COLS
+        self.tree = ttk.Treeview(
+            tree_box, columns=cols, show="", height=self.PAGE_SIZE,
+            style="Candidate.Treeview", selectmode="browse",
+        )
+        # 隐藏原生 #0 树列，避免左侧出现空白列
+        self.tree.column("#0", width=0, minwidth=0, stretch=False)
+        for c, w, anchor in [
+            ("part_number", 110, "w"),
+            ("model", 200, "w"),
+            ("manufacturer", 110, "w"),
+            ("capacity", 130, "center"),
+            ("type", 80, "center"),
+        ]:
             self.tree.column(c, width=w, anchor=anchor)
         # tree 占大头（fill both + expand），但放进 tree_box 后由 box 控制边界
         # side=TOP + expand=True：吃占 pager 留下的剩余空间
         self.tree.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        # 初始同步一次表头位置/宽度
+        self._sync_header_labels()
         self.tree.bind("<<TreeviewSelect>>", self._on_candidate_select)
         self.tree.bind("<Double-1>", self._on_candidate_activate)
         # 宽度自适应：五列始终铺满当前左栏可视宽度（不裁剪也不留白）
@@ -742,14 +1070,26 @@ class App(tk.Tk):
         self.tree.bind("<Motion>", self._on_tree_motion)
         self.tree.bind("<ButtonPress-1>", self._on_tree_press)
         self.tree.bind("<Leave>", self._on_tree_leave)
+        # 行级悬停提示（#7）：数据行停留 600ms 显示完整料号/厂商/容量（add 叠加
+        # 绑定，不干扰上面的光标切换逻辑）；滚轮换行后提示失准 → 直接隐藏
+        self.tree.bind("<Motion>", self._on_tree_tip_motion, add="+")
+        self.tree.bind("<Leave>", self._on_tree_tip_leave, add="+")
+        self.tree.bind("<MouseWheel>", lambda e: self._tree_tip_hide(), add="+")
 
-        # 左右分栏分隔条：按住拖动调整左栏宽度，右栏随之动态适配
-        sash = tk.Frame(body, width=6, bg=COLOR_BORDER, cursor="sb_h_double_arrow")
+        # 左右分栏分隔条：按住拖动调整左栏宽度，右栏随之动态适配。
+        # #6 扩大点击目标：画布命中区 12px（原 6px 视觉条即命中区，太窄难点中），
+        # 中间 6px 视觉条居中绘制——hover/拖动高亮只重画视觉条（itemconfigure），
+        # 命中区宽度恒定
+        sash = tk.Canvas(body, width=self._s(12), height=1, bg=COLOR_BG,
+                         highlightthickness=0, bd=0, cursor="sb_h_double_arrow")
         sash.grid(row=0, column=1, sticky="ns")
         sash.bind("<Enter>", self._on_sash_enter)
         sash.bind("<Leave>", self._on_sash_leave)
         sash.bind("<ButtonPress-1>", self._on_sash_press)
+        sash.bind("<Configure>", lambda e: self._render_sash_band())
         self.sash = sash
+        self._sash_color = COLOR_BORDER
+        self._sash_band = sash.create_rectangle(0, 0, 1, 1, fill=COLOR_BORDER, width=0)
 
         # 右栏：详情卡片（吃掉左栏/分隔条之外的剩余宽度）
         right = ttk.Frame(body, style="TFrame")
@@ -775,25 +1115,39 @@ class App(tk.Tk):
         # 默认空状态
         self._render_detail_empty()
 
-        # 底部操作栏
+        # 底部操作栏（#7：tooltip 带上快捷键提示，能点也知道怎么快）
         bottom = ttk.Frame(self, style="Panel.TFrame", padding=(14, 8))
         bottom.pack(fill=tk.X, side=tk.BOTTOM)
-        ttk.Button(bottom, text="复制全部", style="Accent.TButton",
-                   command=lambda: self._copy_current(make_text_for_copy, "已复制全部字段到剪贴板")).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(bottom, text="复制料号", style="Blue.TButton",
-                   command=self._copy_part_no).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(bottom, text="清空", style="Ghost.TButton",
-                   command=self._clear_query).pack(side=tk.LEFT, padx=(0, 6))
+        b = ttk.Button(bottom, text="复制全部", style="Accent.TButton",
+                       command=lambda: self._copy_current(make_text_for_copy, "已复制全部字段到剪贴板"))
+        b.pack(side=tk.LEFT, padx=(0, 6))
+        ToolTip(b, "复制当前记录的全部字段到剪贴板")
+        b = ttk.Button(bottom, text="复制料号", style="Blue.TButton",
+                       command=self._copy_part_no)
+        b.pack(side=tk.LEFT, padx=(0, 6))
+        ToolTip(b, "复制当前记录的料号 (Ctrl+C)")
+        b = ttk.Button(bottom, text="清空", style="Ghost.TButton",
+                       command=self._clear_query)
+        b.pack(side=tk.LEFT, padx=(0, 6))
+        ToolTip(b, "清空查询输入 (Esc)")
         ttk.Separator(bottom, orient="vertical").pack(side=tk.LEFT, fill=tk.Y, padx=(0, 6))
-        ttk.Button(bottom, text="导入 CSV", style="Ghost.TButton",
-                   command=self._import_csv).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(bottom, text="导出 CSV", style="Ghost.TButton",
-                   command=self._export_csv).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(bottom, text="刷新数据", style="Ghost.TButton",
-                   command=self._reload_db).pack(side=tk.LEFT, padx=(0, 6))
+        b = ttk.Button(bottom, text="导入 CSV", style="Ghost.TButton",
+                       command=self._import_csv)
+        b.pack(side=tk.LEFT, padx=(0, 6))
+        ToolTip(b, "导入 CSV 合并到现有数据库")
+        b = ttk.Button(bottom, text="导出 CSV", style="Ghost.TButton",
+                       command=self._export_csv)
+        b.pack(side=tk.LEFT, padx=(0, 6))
+        ToolTip(b, "导出当前数据库为 CSV")
+        b = ttk.Button(bottom, text="刷新数据", style="Ghost.TButton",
+                       command=self._reload_db)
+        b.pack(side=tk.LEFT, padx=(0, 6))
+        ToolTip(b, "弃用缓存，强制重建当前数据源 (F5)")
         ttk.Separator(bottom, orient="vertical").pack(side=tk.LEFT, fill=tk.Y, padx=(0, 6))
-        ttk.Button(bottom, text="退出", style="Ghost.TButton",
-                   command=self.destroy).pack(side=tk.RIGHT)
+        b = ttk.Button(bottom, text="退出", style="Ghost.TButton",
+                       command=self.destroy)
+        b.pack(side=tk.RIGHT)
+        ToolTip(b, "退出程序")
 
     # ---------------- 交互 ----------------
 
@@ -918,20 +1272,64 @@ class App(tk.Tk):
         self.bind("<Down>", self._on_arrow_down)
         self.bind("<Control-c>", lambda e: self._copy_part_no())
         self.bind("<Control-C>", lambda e: self._copy_part_no())
-        self.bind("<Escape>", lambda e: self._clear_query())
+        self.bind("<Escape>", self._on_escape)
         self.bind("<F5>", lambda e: self._reload_db())
 
     def _refresh_status(self):
+        """状态栏主文案。
+
+        UI 评审 #8 去重：原文案「模式 X · LABEL · 文件名 • 共 N 条记录」里
+        模式名与 describe() 的 LABEL 重复、文件名又与切换完成 toast 撞文案
+        → 常驻只留「模式 · 条数」，完整描述移入悬停 tooltip（动态更新）；
+        窄窗口只留条数（模式看顶栏 radio 选中态）。
+        """
         mode_label = MODE_LABELS.get(self.settings.mode, self.settings.mode)
-        self.status_label.configure(
-            text=f"模式 {mode_label} · {self.source.describe()}"
-                 f"   •   共 {self.source.count()} 条记录"
-        )
+        count = self.source.count()
+        self._status_compact = self._status_is_compact()
+        if self._status_compact:
+            self.status_label.configure(text=f"共 {count} 条")
+        else:
+            self.status_label.configure(text=f"{mode_label} · 共 {count} 条")
+        tip = self._status_tooltip
+        if tip is not None:
+            tip.update_text(self.source.describe())
+
+    def _status_is_compact(self) -> bool:
+        """窗口宽是否低于状态栏完整文案阈值（逻辑 1150px）。
+
+        阈值依据：标题 + 完整文案 + radio 组 + 极简按钮可同排共存的最小宽，
+        低于它完整文案会挤压右侧 radio 区域。窗口尚未量出尺寸
+        （winfo_width ≤ 1，__init__ 首调时还没布局）按非紧凑处理，避免
+        启动首帧误入紧凑态。
+        """
+        try:
+            w = self.winfo_width()
+        except Exception:
+            return False
+        if w <= 1:
+            return False
+        return w < self._s(1150)
 
     def _refresh_source_buttons(self):
         """把 radio 组件选中项同步到当前模式（互斥由共享变量自动保证）。"""
         if self.var_source_mode.get() != self.settings.mode:
             self.var_source_mode.set(self.settings.mode)
+
+    def _set_radios_enabled(self, enabled: bool):
+        """数据源 radio 批量启停：后台切换期间禁用（#12 忙碌指示）。"""
+        state = ("!disabled",) if enabled else ("disabled",)
+        for rb in self._source_radios:
+            try:
+                rb.state(state)
+            except tk.TclError:
+                pass
+
+    def _switch_elapsed(self) -> float:
+        """当前/刚完成的一次数据源切换耗时（秒），用于完成 toast（#12）。"""
+        started = self._switch_started
+        if started is None:
+            return 0.0
+        return max(0.0, time.monotonic() - started)
 
     def _on_source_radio(self):
         """radio 单选回调：用户选中哪个单选项就切换哪个数据源。"""
@@ -977,6 +1375,10 @@ class App(tk.Tk):
         self.status_label.configure(
             text=f"正在{'刷新' if force else '切换'}数据源至「{label}」…"
         )
+        self._switch_started = time.monotonic()
+        # 忙碌期间禁用 radio（#12）：后台构建是秒级重活，连点只会往
+        # latest-wins 队列后排；禁用态比「点了没反应」更明确。收尾自动恢复。
+        self._set_radios_enabled(False)
         self._start_switch_worker(token, mode, force)
         self._ensure_polling()
 
@@ -1062,11 +1464,14 @@ class App(tk.Tk):
         # 若无更新的切换目标，把 radio 与查询结果对齐；否则让位给最新请求
         if self._desired_mode is None:
             self._refresh_source_buttons()
+            elapsed = self._switch_elapsed()
             if changed:
                 label = MODE_LABELS.get(mode, mode)
-                self._toast(f"已切换至「{label}」：{self.source.describe()} 共 {len(records)} 条")
+                # #8 去重：条数/描述状态栏刚刷新过、文件名悬停可见 →
+                # toast 只说结果与耗时（#12）
+                self._toast(f"已切换至「{label}」 · {elapsed:.1f}s")
             else:
-                self._toast(f"已刷新：{self.source.describe()} 共 {len(records)} 条")
+                self._toast(f"已刷新 · {elapsed:.1f}s")
             if self.var_query.get().strip():
                 self._run_query()
             else:
@@ -1075,11 +1480,16 @@ class App(tk.Tk):
             if not changed and self.on_change:
                 self.on_change()
         self._switch_busy = False
+        # 切换收尾：radio 恢复可用（#12）；若 latest-wins 队列还有新目标，
+        # 下一行 _pump_switch 会立刻再次禁用并接力
+        self._set_radios_enabled(True)
         self._pump_switch()
 
     def _handle_switch_error(self, token: int, mode: str, exc: Exception):
         """后台构建失败：回滚 radio/状态；若用户又点了新模式则直接接力。"""
         self._switch_busy = False
+        # 失败收尾：radio 恢复可用（#12），让用户重试或改选其他模式
+        self._set_radios_enabled(True)
         if self._desired_mode is None:
             # 没有更新的目标 → 回滚到当前已加载模式并提示
             self._refresh_source_buttons()
@@ -1109,6 +1519,17 @@ class App(tk.Tk):
         self._query_after_id = None
         self._run_query()
 
+    def _on_escape(self, event=None):
+        """Esc：极简模式下先退出极简；否则清空查询输入。
+
+        输入框与顶层都绑定本方法并返回 "break"，避免一次按键触发两处。
+        """
+        if self._minimal_mode:
+            self._set_minimal_mode(False)
+            return "break"
+        self._clear_query()
+        return "break"
+
     def _on_enter(self):
         """回车：如果候选唯一或已选定某项 → 显示详情；否则聚焦候选列表第一项。"""
         self._cancel_pending_query()
@@ -1116,6 +1537,8 @@ class App(tk.Tk):
             self._run_query()
             return
         if self._selected_index >= 0 and self._selected_index < len(self._candidates):
+            # 极简模式下不退回完整模式：详情在后台静默更新，
+            # 搜索/回车绝不打断极简状态，更不改写持久化偏好
             rec = self._candidates[self._selected_index][0]
             self._render_detail(rec)
             self.entry.focus_set()
@@ -1178,8 +1601,13 @@ class App(tk.Tk):
         self._selected_index = idx
         rec = self._candidates[idx][0]
         self._render_detail(rec)
+        if self._minimal_mode:
+            # 极简模式详情区隐藏（#11）：选中即后台静默更新，用户感知不到
+            # → 状态栏 toast 点明；连续选择经 _toast 防抖不闪烁
+            self._toast("详情已在后台更新 · Esc 返回完整模式查看")
 
     def _on_candidate_activate(self, event=None):
+        # 双击同样不打断极简模式（详情后台更新）；退出极简只走按钮或 Esc
         self._on_candidate_select(event)
 
     # ---------------- 候选区分页 / 加载更多 ----------------
@@ -1217,13 +1645,17 @@ class App(tk.Tk):
             start = page * page_size
             end = min(start + page_size, total)
             self._insert_rows(start, end)
-            # 分页控件：«  第 N/M 页  ·  共 X 条  »
-            ttk.Button(self.pager_frame, text="«", style="ModeSel.TButton", width=2,
-                       command=self._prev_page).pack(side=tk.LEFT, padx=(0, 4))
+            # 分页控件：«  第 N/M 页  ·  共 X 条  »（#7：«» 缩写悬停说明）
+            btn_prev = ttk.Button(self.pager_frame, text="«", style="ModeSel.TButton", width=2,
+                                  command=self._prev_page)
+            btn_prev.pack(side=tk.LEFT, padx=(0, 4))
+            ToolTip(btn_prev, "上一页")
             ttk.Label(self.pager_frame, text=f"第 {page + 1} / {total_pages} 页",
                       style="Hint.TLabel").pack(side=tk.LEFT)
-            ttk.Button(self.pager_frame, text="»", style="ModeSel.TButton", width=2,
-                       command=self._next_page).pack(side=tk.LEFT, padx=(4, 0))
+            btn_next = ttk.Button(self.pager_frame, text="»", style="ModeSel.TButton", width=2,
+                                  command=self._next_page)
+            btn_next.pack(side=tk.LEFT, padx=(4, 0))
+            ToolTip(btn_next, "下一页")
             ttk.Label(self.pager_frame, text=f"·  共 {total} 条",
                       style="Hint.TLabel").pack(side=tk.LEFT, padx=(8, 0))
         else:  # load_more
@@ -1253,83 +1685,187 @@ class App(tk.Tk):
 
     # 候选表五列（顺序/语义固定）
     _TREE_COLS = ("part_number", "model", "manufacturer", "capacity", "type")
-    # 左栏右缘与分隔条之间的留白（grid padx，_apply_pane_width 需一并计入列宽）
+    # 左栏右缘与分隔条之间的留白（grid padx 逻辑值；__init__ 里按 DPI 缩放为
+    # 实例属性，_apply_pane_width 需一并计入列宽）
     _LEFT_PADX = 7
-    # 候选表五列的权重与最小列宽（仅布局细节，不改变列语义/顺序）
-    _TREE_COL_MIN = {
-        "part_number": 64, "model": 50, "manufacturer": 44,
-        "capacity": 130, "type": 40,
+    # 候选表五列宽度策略（逻辑像素，使用时经 _col_metrics 按 DPI 缩放）。
+    # 三档语义，解决「窄左栏下料号列被挤到只剩 2 字符」的核心问题：
+    #   PREFERRED 常规最小宽：接近完整内容的最小宽度，空间富余时从此起步；
+    #   FLOOR     硬底线：极限可辨宽（低于此内容完全不可读），缺口分配的起点；
+    #   DEFICIT_W 缺口分配权重：可用宽介于 sum(FLOOR) 与 sum(PREFERRED) 之间时，
+    #             富余量按此分配——料号是查询工具的核心数据，占比最高；
+    #             型号与料号高度重复（本数据集两者字符串基本一致），最先被压缩。
+    _TREE_COL_PREFERRED = {
+        "part_number": 128, "model": 96, "manufacturer": 62,
+        "capacity": 102, "type": 40,
     }
+    _TREE_COL_FLOOR = {
+        "part_number": 88, "model": 32, "manufacturer": 46,
+        "capacity": 72, "type": 30,
+    }
+    _TREE_COL_DEFICIT_W = {
+        "part_number": 0.46, "capacity": 0.20, "manufacturer": 0.15,
+        "model": 0.11, "type": 0.08,
+    }
+    # 常规分支的加宽权重（超出 PREFERRED 的富余按此分配）
     _TREE_COL_WEIGHT = {
         "part_number": 0.35, "model": 0.30, "manufacturer": 0.20,
         "capacity": 0.10, "type": 0.05,
     }
 
+    def _col_metrics(self):
+        """列宽策略常量的 DPI 缩放副本（缓存，避免拖栏高频调用重复换算）。
+
+        注意：仅两个「像素」字典（PREFERRED/FLOOR）参与缩放；两个「比例」
+        字典（DEFICIT_W/WEIGHT）必须原样返回——若走 int(round(0.46)) 会把
+        权重全部归零/钳一，分配退化为等权（实测踩坑）。
+        """
+        cached = getattr(self, "_col_metrics_cache", None)
+        if cached is None:
+            s = self._ui_scale
+            cached = (
+                {c: max(1, int(round(v * s))) for c, v in self._TREE_COL_PREFERRED.items()},
+                {c: max(1, int(round(v * s))) for c, v in self._TREE_COL_FLOOR.items()},
+                dict(self._TREE_COL_DEFICIT_W),
+                dict(self._TREE_COL_WEIGHT),
+            )
+            self._col_metrics_cache = cached
+        return cached
+
     def _fit_tree_columns(self, width: Optional[int] = None):
         """把候选表 5 列的总宽铺满当前左栏可视宽度，杜绝横向裁切/留白。
 
-        - 默认：按信息重要度权重分配（料号/型号优先）。
-        - 用户拖过列宽后：保留用户设定的各列比例，窗口缩放时等比缩放铺满。
+        三段式分配（宽度常量见 _TREE_COL_PREFERRED/_FLOOR/_DEFICIT_W）：
+        - 常规（avail ≥ ΣPREFERRED）：PREFERRED 起步，富余按 WEIGHT 加宽；
+        - 缺口（ΣFLOOR ≤ avail < ΣPREFERRED）：从 FLOOR 起步，富余按 DEFICIT_W
+          分配（料号优先、单列不超过 PREFERRED，超出的份额回流给其余列）——
+          旧版在此场景把缺口全部记在料号头上（容量列保住 130px、料号仅剩
+          24px 只显示 2 字符），是核心数据不可读的根因；
+        - 极窄（avail < ΣFLOOR）：按 FLOOR 等比压缩，料号保持最大占比。
+        - 用户拖过列宽后：保留用户设定的各列比例等比缩放，但以 FLOOR 托底。
         """
         tree = self.tree
         try:
-            avail = (width if width else tree.winfo_width()) - 4
+            avail = (width if width else tree.winfo_width()) - self._s(4)
         except Exception:
             return
-        if avail < 180:
+        if avail < self._s(180):
             return
         cols = self._TREE_COLS
+        pref, floor, defw, weight = self._col_metrics()
         if self._tree_col_custom and self._tree_col_cache:
-            # 自定义模式：把当前各列宽等比缩放到新可视宽度（保留用户手感）
+            # 自定义模式：把当前各列宽等比缩放到新可视宽度（保留用户手感），
+            # 以 FLOOR 托底（旧版用 PREFERRED 托底，窄栏下会撑爆总宽造成尾部裁切）
             old_total = sum(self._tree_col_cache)
             if old_total > 0:
                 plan = [
-                    max(self._TREE_COL_MIN[c], int(w * avail / old_total + 0.5))
+                    max(floor[c], int(w * avail / old_total + 0.5))
                     for w, c in zip(self._tree_col_cache, cols)
                 ]
                 # 四舍五入误差并入首列，保证总宽严格等于可视宽度
                 plan[0] += avail - sum(plan)
-                widths = tuple(plan)
-                if widths == self._tree_col_cache:
+                plan[0] = max(floor[cols[0]], plan[0])
+                if sum(plan) == avail:
+                    widths = tuple(plan)
+                    if widths == self._tree_col_cache:
+                        return
+                    self._tree_col_cache = widths
+                    for c, w in zip(cols, widths):
+                        tree.column(c, width=w)
+                    self._sync_header_labels()
                     return
-                self._tree_col_cache = widths
-                for c, w in zip(cols, widths):
-                    tree.column(c, width=w)
-                return
-        base = sum(self._TREE_COL_MIN[k] for k in cols)
-        extra = max(0, avail - base)
-        plan = {
-            k: self._TREE_COL_MIN[k] + int(extra * self._TREE_COL_WEIGHT[k])
-            for k in cols
-        }
-        # 把四舍五入误差并入「料号」列，保证总和与可视宽度严格一致
-        plan["part_number"] = avail - sum(plan[k] for k in cols[1:])
-        widths = tuple(plan[k] for k in cols)
+                # 托底后总宽放不下（用户比例与硬底线冲突，左栏过窄）：
+                # 本次放弃保手感，落到下方标准三段分配（_tree_col_custom 保持
+                # 不变，窗口重新变宽后仍优先按用户比例缩放）
+        base = sum(floor.values())
+        pref_total = sum(pref.values())
+        if avail <= base:
+            # 极窄：按 FLOOR 等比压缩（比例缩放保料号最大占比）
+            raw = {c: floor[c] * avail / base for c in cols}
+        elif avail < pref_total:
+            # 缺口：FLOOR 起步 + DEFICIT_W 分配富余，单列封顶 PREFERRED，
+            # 触顶列退出分配、份额回流其余列（水量填充，最多数轮收敛）
+            raw = {c: float(floor[c]) for c in cols}
+            pool = float(avail - base)
+            active = list(cols)
+            for _ in range(4):
+                if pool <= 1.0 or not active:
+                    break
+                wsum = sum(defw[c] for c in active)
+                progressed = False
+                for c in list(active):
+                    give = pool * defw[c] / wsum
+                    room = pref[c] - raw[c]
+                    take = min(give, room)
+                    if take > 0:
+                        raw[c] += take
+                        pool -= take
+                        progressed = True
+                    if pref[c] - raw[c] < 0.5:
+                        active.remove(c)
+                if not progressed:
+                    break
+        else:
+            # 常规：PREFERRED 起步，富余按 WEIGHT 加宽
+            extra = avail - pref_total
+            raw = {c: pref[c] + extra * weight[c] for c in cols}
+        plan = {c: max(self._s(20), int(round(raw[c]))) for c in cols}
+        # 舍入尾差并入「料号」列，保证总和与可视宽度严格一致
+        plan["part_number"] = max(self._s(20),
+                                  plan["part_number"] + avail - sum(plan.values()))
+        widths = tuple(plan[c] for c in cols)
         if widths == self._tree_col_cache:
             return
         self._tree_col_cache = widths
         for k in cols:
-            tree.column(k, width=max(20, plan[k]))
+            tree.column(k, width=plan[k])
+        self._sync_header_labels()
 
-    # ---------------- 左栏列宽鼠标拖拽 ----------------
+    def _sync_header_labels(self):
+        """让自定义表头 label 的宽度/位置与 tree 列宽严格同步。
 
-    def _tree_header_height(self) -> int:
-        """估算表头高度：优先取第一行顶边的 y 坐标，空表时用常量兜底。"""
+        列宽由 _fit_tree_columns / _on_col_drag 维护；每次列宽变化后调用本方法，
+        header_frame 内的 tk.Label 会按 tree.column(c, "width") 被 place 到对应
+        x 坐标，确保拖动左栏或列分隔线时标题与下方单元格始终对齐。
+
+        水平补偿：
+        - Treeview 内容区相对树 widget 有 ~2px 左边框（取首行 bbox 校准）；
+        - 单元格文字还有 ~_CELL_TEXT_PADX 的固定水平内边距。
+        因此左锚定列的表头文字要再右移同样距离，才能和单元格文字左缘对齐；
+        居中列只需补边框偏移即可让文字中心与单元格中心重合。
+        """
+        if not getattr(self, "_header_labels", None):
+            return
         try:
-            items = self.tree.get_children()
-            if items:
-                b = self.tree.bbox(items[0])
-                if b and b[1] > 0:
-                    return b[1]
+            # 树内容区相对树 widget 的左边框是固定 2px（DPI 缩放下偶发 bbox 抖动
+            # 返回 3，故不用实测值，直接用常量，保证多次同步结果稳定）
+            off = 2
+            pad = self._CELL_TEXT_PADX
+            x = 0
+            for c in self._TREE_COLS:
+                w = self.tree.column(c, "width")
+                lbl = self._header_labels[c]
+                if self._header_anchor.get(c) == "w":
+                    lbl.place(x=x + off + pad, y=0,
+                              width=max(20, w - off - pad),
+                              height=self._HEADER_HEIGHT)
+                else:
+                    lbl.place(x=x + off, y=0, width=w, height=self._HEADER_HEIGHT)
+                x += w
         except tk.TclError:
             pass
-        return 27
+
+    # ---------------- 左栏列宽鼠标拖拽 ----------------
 
     def _tree_col_widths(self) -> Tuple[int, ...]:
         try:
             return tuple(self.tree.column(c, "width") for c in self._TREE_COLS)
         except tk.TclError:
-            return self._tree_col_cache or tuple(self._TREE_COL_MIN[c] for c in self._TREE_COLS)
+            fallback = self._tree_col_cache
+            if not fallback:
+                floor = self._col_metrics()[1]
+                fallback = tuple(floor[c] for c in self._TREE_COLS)
+            return fallback
 
     def _divider_index_at(self, x: int, tol: int = 6) -> Optional[int]:
         """返回 x 落在哪条表头分隔线上（第 i 列与第 i+1 列之间）；不在则 None。"""
@@ -1341,41 +1877,137 @@ class App(tk.Tk):
                 return i
         return None
 
+    def _tree_event_x(self, event) -> int:
+        """把任意 widget 上的事件 x 换算为树内容区的相对坐标。
+
+        自绘表头的 label/header_frame 与树是不同 widget，event.x 是各自
+        widget 相对坐标；分隔线判定必须统一到树坐标系（逻辑 px）。
+        """
+        if event.widget is self.tree:
+            return event.x
+        try:
+            return event.x + event.widget.winfo_rootx() - self.tree.winfo_rootx()
+        except tk.TclError:
+            return event.x
+
+    def _set_drag_cursor(self, cursor: str):
+        """统一设置/恢复表头与树上的拖拽光标（cursor 是 per-widget 的）。"""
+        widgets = [self.header_frame, self.tree] + list(self._header_labels.values())
+        for w in widgets:
+            try:
+                w.configure(cursor=cursor)
+            except tk.TclError:
+                pass
+
     def _on_tree_motion(self, event):
-        """悬停表头分隔线时把光标切换成左右拖拽箭头，提供可拖拽的视觉反馈。"""
+        """悬停表头分隔线时把光标切换成左右拖拽箭头，提供可拖拽的视觉反馈。
+
+        仅自绘表头（header_frame / 标题 label）上生效；树区域已是数据行，
+        不再提供列宽拖拽热区。
+        """
         if getattr(self, "_col_drag", None):
             return
         want = ""
-        if event.y <= self._tree_header_height():
-            if self._divider_index_at(event.x) is not None:
+        if event.widget is not self.tree and event.y <= self._HEADER_HEIGHT:
+            if self._divider_index_at(self._tree_event_x(event)) is not None:
                 want = "sb_h_double_arrow"
         if want != self._tree_cursor:
             self._tree_cursor = want
-            self.tree.configure(cursor=want)
+            self._set_drag_cursor(want)
 
     def _on_tree_leave(self, event=None):
         if not getattr(self, "_col_drag", None):
             self._tree_cursor = ""
+            self._set_drag_cursor("")
+
+    # ---------------- 行级悬停提示（候选列表数据行，#7） ----------------
+
+    def _tree_row_tooltip_text(self, iid: str) -> str:
+        """数据行提示文案：完整料号 / 厂商 · 容量（列窄被裁的内容在这里看全）。"""
+        try:
+            rec = self._candidates[int(iid)][0]
+        except (ValueError, IndexError, TypeError):
+            return ""
+        pn = (rec.get("part_number", "") or "").strip()
+        mfr = (rec.get("manufacturer", "") or "").strip()
+        cap = _capacity_display(rec.get("capacity", ""), rec.get("bit_width", ""))
+        second = " · ".join(x for x in (mfr, cap) if x)
+        return "\n".join(x for x in (pn, second) if x)
+
+    def _on_tree_tip_motion(self, event):
+        """数据行 Motion：换行即隐藏并重新防抖；停留 600ms 弹出行信息。
+
+        拖列宽（_col_drag）期间抑制——此时指针贴着表头分隔线移动，
+        弹气泡纯属干扰。
+        """
+        if self._col_drag is not None:
+            self._tree_tip_hide()
+            return
+        try:
+            row = self.tree.identify_row(event.y)
+        except tk.TclError:
+            return
+        if row != self._tree_tip_row:
+            self._tree_tip_hide()
+            self._tree_tip_row = row
+            if row:
+                self._tree_tip_after = self.after(
+                    600, lambda: self._tree_tip_show(row))
+
+    def _on_tree_tip_leave(self, _event=None):
+        """指针离开候选列表：取消防抖并收起气泡。"""
+        self._tree_tip_hide()
+        self._tree_tip_row = None
+
+    def _tree_tip_hide(self):
+        """取消挂起的防抖并销毁当前气泡（换行/移出/拖列/滚轮时调用）。"""
+        if self._tree_tip_after is not None:
             try:
-                self.tree.configure(cursor="")
+                self.after_cancel(self._tree_tip_after)
+            except Exception:
+                pass
+            self._tree_tip_after = None
+        if self._tree_tip is not None:
+            try:
+                self._tree_tip.destroy()
             except tk.TclError:
                 pass
+            self._tree_tip = None
+
+    def _tree_tip_show(self, row: str):
+        """防抖到期：若指针仍在触发行上且行数据可读，弹出信息气泡。"""
+        self._tree_tip_after = None
+        if self._col_drag is not None or row != self._tree_tip_row:
+            return
+        try:
+            if not self.tree.exists(row):
+                return
+        except tk.TclError:
+            return
+        text = self._tree_row_tooltip_text(row)
+        if not text:
+            return
+        self._tree_tip = _create_tip_window(self, text)
+        _place_tip_window(self._tree_tip)
 
     def _on_tree_press(self, event):
-        """左键落在表头分隔线附近时接管拖动：本列变宽、右侧各列等量让位（总宽恒定）。
+        """左键落在自绘表头分隔线附近时接管拖动：本列变宽、右侧各列让位（总宽恒定）。
 
-        返回 "break" 以阻止 Treeview 自带的列宽处理，避免两种逻辑互相叠加。
+        树区域（数据行）上的点击直接放行，交给 Treeview 原生的行选择逻辑。
+        返回 "break" 以阻止事件继续传播。
         """
-        if event.y > self._tree_header_height():
+        if event.widget is self.tree:
             return None
-        i = self._divider_index_at(event.x)
+        if event.y > self._HEADER_HEIGHT:
+            return None
+        i = self._divider_index_at(self._tree_event_x(event))
         if i is None:
             return None
         self._col_drag = (i, event.x_root)
         self._col_drag_widths = self._tree_col_widths()  # 拖动起点各列宽（基准）
         self.tree.bind_all("<B1-Motion>", self._on_col_drag)
         self.tree.bind_all("<ButtonRelease-1>", self._on_col_drag_end)
-        self.tree.configure(cursor="sb_h_double_arrow")
+        self._set_drag_cursor("sb_h_double_arrow")
         return "break"
 
     def _on_col_drag(self, event):
@@ -1393,9 +2025,10 @@ class App(tk.Tk):
         total = sum(start)
         dx = event.x_root - x_root0
 
-        min_me = self._TREE_COL_MIN[cols[i]]
-        min_suffix = sum(self._TREE_COL_MIN[cols[j]] for j in range(i + 1, len(cols)))
-        # 可拖范围：自身不窄于 min_me；也不超过「总宽 - 右侧最小宽总和」（右侧不可被挤破）
+        _, floor, _, _ = self._col_metrics()
+        min_me = floor[cols[i]]
+        min_suffix = sum(floor[cols[j]] for j in range(i + 1, len(cols)))
+        # 可拖范围：自身不窄于硬底线；也不超过「总宽 - 右侧硬底线总和」（右侧不可被挤破）
         w_i = max(min_me, min(start[i] + int(round(dx)), total - min_suffix))
         if w_i == start[i]:
             return
@@ -1403,8 +2036,8 @@ class App(tk.Tk):
         delta = w_i - start[i]
 
         if delta > 0:
-            # 加宽：右侧按各自“可压缩余量”成比例收缩（不突破最小宽）
-            slack = [start[j] - self._TREE_COL_MIN[cols[j]] for j in range(i + 1, len(cols))]
+            # 加宽：右侧按各自“可压缩余量”成比例收缩（不突破硬底线）
+            slack = [start[j] - floor[cols[j]] for j in range(i + 1, len(cols))]
             total_slack = sum(slack)
             if total_slack <= 0:
                 return
@@ -1419,11 +2052,12 @@ class App(tk.Tk):
                 if rest <= 0:
                     break
                 cur = self.tree.column(cols[j], "width")
-                cap = cur - self._TREE_COL_MIN[cols[j]]
+                cap = cur - floor[cols[j]]
                 take = min(cap, rest)
                 if take > 0:
                     self.tree.column(cols[j], width=cur - take)
                     rest -= take
+            self._sync_header_labels()
         else:
             # 变窄：释放的像素按右侧当前宽度比例补宽（总宽守恒）
             grow = -delta
@@ -1439,6 +2073,7 @@ class App(tk.Tk):
             # 舍入尾差并入最后一列
             self.tree.column(cols[-1],
                              width=self.tree.column(cols[-1], "width") + (grow - added))
+            self._sync_header_labels()
 
     def _on_col_drag_end(self, event):
         """拖动结束：固化为自定义列宽，窗口缩放时按其比例等比缩放。"""
@@ -1452,23 +2087,48 @@ class App(tk.Tk):
         self._tree_col_custom = True
         self._tree_col_cache = self._tree_col_widths()
         self._tree_cursor = ""
-        self.tree.configure(cursor="")
+        self._set_drag_cursor("")
+        self._sync_header_labels()
 
     # ---------------- 左右分栏拖拽（分隔条） ----------------
 
+    def _render_sash_band(self, color: Optional[str] = None):
+        """重绘分隔条中间的视觉条（全高、6px 居中）；color 缺省用当前色。"""
+        sash = self.sash
+        try:
+            w, h = sash.winfo_width(), sash.winfo_height()
+            if w <= 1 or h <= 1:
+                return  # 尚未布局：<Configure> 回调后会再画
+        except tk.TclError:
+            return
+        if color is None:
+            color = self._sash_color
+        band = self._s(6)
+        x0 = max(0, (w - band) // 2)
+        try:
+            sash.coords(self._sash_band, x0, 0, x0 + band, h)
+            sash.itemconfigure(self._sash_band, fill=color)
+        except tk.TclError:
+            pass
+
+    def _set_sash_color(self, color: str):
+        """hover/拖动高亮：只换视觉条颜色（#6 canvas 化后命中区几何恒定）。"""
+        self._sash_color = color
+        self._render_sash_band(color)
+
     def _on_sash_enter(self, event):
         if not getattr(self, "_pane_drag", None):
-            self.sash.configure(bg="#3a4d63")
+            self._set_sash_color("#3a4d63")
 
     def _on_sash_leave(self, event):
         if not getattr(self, "_pane_drag", None):
-            self.sash.configure(bg=COLOR_BORDER)
+            self._set_sash_color(COLOR_BORDER)
 
     def _on_sash_press(self, event):
-        if self._left_pane_w is None:
+        if self._left_pane_w is None or self._minimal_mode:
             return
         self._pane_drag = (event.x_root, self._left_pane_w)
-        self.sash.configure(bg=COLOR_CARD_HOVER)
+        self._set_sash_color(COLOR_CARD_HOVER)
         self.sash.bind_all("<B1-Motion>", self._on_sash_drag)
         self.sash.bind_all("<ButtonRelease-1>", self._on_sash_release)
 
@@ -1478,7 +2138,9 @@ class App(tk.Tk):
             return
         x_root0, w0 = drag
         body_w = self.body.winfo_width()
-        lo, hi = 240, max(260, body_w - 520)  # 右侧详情区保留最低可用宽度
+        # 拖动范围随 DPI 缩放（原 240/260/520 逻辑像素硬编码）：右侧详情区
+        # 保留最低可用宽度
+        lo, hi = self._s(240), max(self._s(260), body_w - self._s(520))
         target = max(lo, min(hi, int(round(w0 + (event.x_root - x_root0)))))
         if target != self._left_pane_w:
             self._apply_pane_width(target)  # 右栏(weight=1)自动吃剩余宽度并动态重排
@@ -1486,7 +2148,7 @@ class App(tk.Tk):
     def _on_sash_release(self, event):
         self._pane_custom = True
         self._pane_drag = None
-        self.sash.configure(bg=COLOR_BORDER)
+        self._set_sash_color(COLOR_BORDER)
         try:
             self.sash.unbind_all("<B1-Motion>")
             self.sash.unbind_all("<ButtonRelease-1>")
@@ -1495,6 +2157,12 @@ class App(tk.Tk):
 
     def _on_body_configure(self, event):
         """body 首次布局/窗口缩放时同步左栏像素宽：默认按 30% 比例，用户拖过则保持不变。"""
+        if self._minimal_mode:
+            # 极简模式：右栏/分隔条已移除，左栏经 col0 minsize 吃满 body 内部宽
+            # （随窗口缩放联动；不改权重，见 _minimal_finish_enter 的说明）
+            if self._minimal_anim_after is None:
+                self._apply_pane_width(self._body_interior_w() - self._LEFT_PADX)
+            return
         if self._pane_custom:
             return
         try:
@@ -1505,10 +2173,12 @@ class App(tk.Tk):
             self._apply_pane_width(target)
 
     def _default_pane_width(self, body_w: int) -> int:
-        """左栏默认宽度：约 body 可视宽 30%，且保证右侧详情区不小于 480px。"""
-        content = max(400, body_w - 30)
-        left = max(250, int(content * 0.30))
-        return min(left, max(250, content - 480))
+        """左栏默认宽度：约 body 可视宽 40%——候选列表是核心阅读区，需保证
+        料号列在默认窗口宽度下完整可读（40% 时 avail ≈ 364px ≥ 料号完整宽
+        128 + 其余列硬底线）；且保证右侧详情区不小于 480（逻辑）px。"""
+        content = max(self._s(400), body_w - self._s(30))
+        left = max(self._s(250), int(content * 0.40))
+        return min(left, max(self._s(250), content - self._s(480)))
 
     def _apply_pane_width(self, px: int):
         """设置左栏像素宽：同步 grid 列 minsize 强制重排。
@@ -1517,6 +2187,11 @@ class App(tk.Tk):
         因此必须以 columnconfigure 通知 grid 管理器。
         注意：grid 会把列 cell 的 padx（左栏右缘 7px）计入整列宽度，所以 minsize
         要加回 _LEFT_PADX，widget 实际宽度才等于 px。
+
+        复钉机制：紧跟几何事件（body Configure / grid_remove 右栏）发出的
+        minsize 变更，Tk 可能在同一轮布局计算中吞掉（左栏卡在旧宽度，实测
+        复现）。因此调度一次 after_idle 复钉——读当前 _left_pane_w 重设同一
+        minsize，下一轮布局计算稳定生效。幂等且防抖（拖栏高频调用无副作用）。
         """
         self._left_pane_w = px
         self.left.configure(width=px)
@@ -1524,6 +2199,218 @@ class App(tk.Tk):
             self.body.columnconfigure(0, minsize=px + self._LEFT_PADX)
         except tk.TclError:
             pass
+        if self._pane_repin_after is None:
+            try:
+                self._pane_repin_after = self.after_idle(self._pane_repin)
+            except tk.TclError:
+                pass
+
+    def _pane_repin(self):
+        """after_idle 复钉：用最新 _left_pane_w 重设 col0 minsize（见 _apply_pane_width）。"""
+        self._pane_repin_after = None
+        px = self._left_pane_w
+        if px is None:
+            return
+        try:
+            self.body.columnconfigure(0, minsize=px + self._LEFT_PADX)
+        except tk.TclError:
+            pass
+
+    # ---------------- 窗口尺寸记忆 ----------------
+
+    DEFAULT_WINDOW_SIZE = (1040, 720)  # 默认窗口尺寸（从未手动调整过时使用）
+
+    def _enable_win_size_tracking(self):
+        """启动布局稳定后开启尺寸跟踪；当前尺寸视为基准（不触发保存）。"""
+        self._win_size_ready = True
+        self._last_saved_win_size = (self.winfo_width(), self.winfo_height())
+        # 布局已稳定 → 按真实窗口宽重算一次状态栏完整/紧凑文案（#8：
+        # __init__ 里的首刷发生在布局前，紧凑态判定还没法基于真实宽度）
+        self._refresh_status()
+
+    def _initial_window_size(self) -> Tuple[int, int]:
+        """启动窗口尺寸（物理像素）：优先用户上次手动调整并保存的尺寸。
+
+        配置里 window_size 存的是「逻辑像素」（96 DPI 基准），按当前 DPI 因子
+        换算为物理像素——跨缩放比例（如换 125%/100% 显示器）恢复的视觉大小
+        一致。收敛规则：不小于 minsize，不超过当前屏幕大小（防止换显示器/
+        改分辨率后窗口超出屏幕）。
+        """
+        w, h = self.DEFAULT_WINDOW_SIZE
+        saved = self.settings.window_size
+        if saved:
+            try:
+                sw, sh = str(saved).lower().split("x", 1)
+                w, h = int(sw), int(sh)
+            except (ValueError, AttributeError):
+                pass  # 非法格式回落默认（validate 一般已拦截）
+        w, h = self._s(w), self._s(h)
+        try:
+            screen_w, screen_h = self.winfo_screenwidth(), self.winfo_screenheight()
+        except Exception:
+            screen_w, screen_h = 3840, 2160
+        min_w, min_h = self.minsize()
+        w = max(min_w, min(w, screen_w))
+        # 高度预留标题栏/任务栏余量（逻辑 60px）：客户区顶满屏幕时，WM 会先压
+        # 窗口、Tk 再强制回 minsize，请求值静默失效（实测 864 高请求落在 850）
+        h = max(min_h, min(h, screen_h - self._s(60)))
+        return w, h
+
+    def _on_window_configure(self, event):
+        """顶层尺寸变化 → 防抖 500ms 后持久化（只记用户手动调整）。
+
+        注意：toplevel 的 bind(<Configure>) 会经 bindtags 收到所有子组件的
+        Configure 事件，必须用 event.widget is self 过滤；启动就绪前的
+        程序性变化一律忽略；拖拽缩放期间连续事件用防抖合并。
+        """
+        if event.widget is not self or not self._win_size_ready:
+            return
+        # 跨越窄窗阈值 → 状态栏在完整/紧凑文案间切换（#8；只在状态翻转时重绘）
+        if self._status_is_compact() != self._status_compact:
+            self._refresh_status()
+        if self._win_size_save_after is not None:
+            try:
+                self.after_cancel(self._win_size_save_after)
+            except Exception:
+                pass
+        self._win_size_save_after = self.after(500, self._save_window_size)
+
+    def _save_window_size(self):
+        """防抖落地：当前窗口尺寸写入 chiplookup.json。
+
+        最大化(zoomed)时不记录——保留最近一次正常尺寸，还原窗口不丢；
+        与上次已保存尺寸相同则跳过（去重，避免无谓写盘）。
+        写入的是「逻辑像素」（物理尺寸 ÷ DPI 因子）：配置跨缩放比例稳定，
+        96 DPI 环境下因子为 1.0，与旧格式完全兼容。
+        """
+        self._win_size_save_after = None
+        try:
+            if self.state() == "zoomed":
+                return
+            w, h = self.winfo_width(), self.winfo_height()
+        except Exception:
+            return
+        if (w, h) == self._last_saved_win_size or w < 300 or h < 300:
+            return
+        self._last_saved_win_size = (w, h)
+        scale = self._ui_scale if self._ui_scale else 1.0
+        self.settings.window_size = "%dx%d" % (
+            int(round(w / scale)), int(round(h / scale)))
+        try:
+            self.settings.save()
+        except Exception:
+            pass  # 写失败不影响运行
+
+    # ---------------- 极简模式（隐藏右栏详情区，仅保留查询列表） ----------------
+
+    def _body_interior_w(self) -> int:
+        """body 内部可用宽（扣除 ttk padding (14, 0) 的左右 14+14，随 DPI 缩放）。"""
+        return max(self._s(300), self.body.winfo_width() - self._s(28))
+
+    def _toggle_minimal_mode(self):
+        self._set_minimal_mode(not self._minimal_mode)
+
+    def _set_minimal_mode(self, minimal: bool, animate: bool = True):
+        """切换极简模式，并把偏好持久化到 chiplookup.json。
+
+        进极简：右栏/分隔条保留在布局中，左栏 minsize 逐帧增大——grid 在空间
+        不足时从 weight>0 的列（右栏）收缩，因此只改左栏 minsize 就能得到
+        右栏被平滑挤压的过渡；收尾时移除右栏与分隔条，左栏列改为 weight=1
+        继续吃掉窗口剩余宽（窗口缩放由 _on_body_configure 联动）。
+        出极简：先恢复右栏/分隔条布局（右栏从 0 宽起步），左栏 minsize 逐帧
+        减回原宽（用户没拖过分隔条则按窗口 30% 重新计算）。
+        """
+        minimal = bool(minimal)
+        if minimal == self._minimal_mode and self._minimal_anim_after is None:
+            return
+        self._cancel_minimal_anim()
+        self._minimal_mode = minimal
+        self.btn_minimal.configure(text="退出极简" if minimal else "极简模式")
+
+        if minimal:
+            if self._minimal_saved_w is None:
+                body_w = max(self.body.winfo_width(), 600)
+                self._minimal_saved_w = (
+                    self._left_pane_w
+                    if self._left_pane_w is not None
+                    else self._default_pane_width(body_w)
+                )
+            if animate:
+                # 动画终点：右栏恰好被压到 0 宽。扣除 = 左padx + 分隔条命中区宽
+                # + 右padx3（#6 扩宽后分隔条 12px，不再写死 16=7+6+3）
+                overhead = self._s(7) + self._s(12) + 3
+                target = self._body_interior_w() - overhead
+                self._anim_left_width(
+                    self._left_pane_w or target, target,
+                    on_done=self._minimal_finish_enter,
+                )
+            else:
+                self._minimal_finish_enter()
+        else:
+            # 恢复右栏/分隔条布局（col0 minsize 仍占满 → 右栏从 0 宽起步，
+            # 随后逐帧减 minsize 让右栏回弹；列权重全程不变，见 _minimal_finish_enter）
+            self.right.grid()
+            self.sash.grid()
+            if self._pane_custom:
+                target = self._minimal_saved_w or self._default_pane_width(
+                    max(self.body.winfo_width(), 600)
+                )
+            else:
+                target = self._default_pane_width(max(self.body.winfo_width(), 600))
+            if animate:
+                self._anim_left_width(self._left_pane_w or target, target)
+            else:
+                self._apply_pane_width(target)
+
+        # 偏好持久化（下次启动自动恢复）
+        self.settings.minimal_mode = minimal
+        try:
+            self.settings.save()
+        except Exception:
+            pass  # 配置写失败不影响本次切换
+
+    def _minimal_finish_enter(self):
+        """进极简收尾：左栏经 col0 minsize 吃满窗口内部宽，再移除右栏/分隔条。
+
+        顺序至关重要（实测锁定）：必须先应用目标宽、再 grid_remove。同一轮
+        回调里「先移除、后改 minsize」会被 Tk 合并成一次布局计算，左栏会卡
+        在进极简前的旧宽度；而「先加宽（此时右栏还在布局中，被 weight=1 的
+        col2 挤到 0 宽）再移除」宽度稳定生效。全程不改列权重（col0 恒
+        weight=0 / col2 恒 weight=1）：实测 grid 对 weight=1 列的 minsize
+        变化不触发重新分配，weight=0 列的 minsize 变化始终可靠（完整模式
+        拖栏即依赖此机制）。末尾 after_idle 复钉一次，防跨轮合并丢失。
+        """
+        # widget 宽 = 内部宽 - 自身 padx(7)，cell 恰好占满、不依赖边缘裁剪。
+        # 移除右栏后可能被吞掉的这次 minsize 变更，由 _apply_pane_width 的
+        # after_idle 复钉机制兜底，无需在此额外补一次。
+        self._apply_pane_width(self._body_interior_w() - self._LEFT_PADX)
+        self.right.grid_remove()
+        self.sash.grid_remove()
+
+    def _cancel_minimal_anim(self):
+        if self._minimal_anim_after is not None:
+            try:
+                self.after_cancel(self._minimal_anim_after)
+            except Exception:
+                pass
+            self._minimal_anim_after = None
+
+    def _anim_left_width(self, w_from: int, w_to: int, on_done=None):
+        """~180ms ease-out 逐帧过渡左栏宽（右栏 weight=1 自动跟随伸缩）。"""
+        steps = 10
+        interval = max(16, 180 // steps)
+
+        def frame(i: int):
+            self._minimal_anim_after = None
+            t = i / steps
+            eased = 1.0 - (1.0 - t) ** 2  # 二次 ease-out：先快后慢
+            self._apply_pane_width(int(round(w_from + (w_to - w_from) * eased)))
+            if i < steps:
+                self._minimal_anim_after = self.after(interval, lambda: frame(i + 1))
+            elif on_done:
+                on_done()
+
+        frame(0)
 
     def _refresh_value_wrap(self):
         """详情字段值随详情画布宽度自适应换行（长文本不再被静默裁切）。"""
@@ -1549,12 +2436,14 @@ class App(tk.Tk):
         total = len(self._candidates)
         count = min(self._visible_count, total)
         if count < total:
-            ttk.Button(
+            load_more_btn = ttk.Button(
                 self.pager_frame,
                 text=f"加载更多（还剩 {total - count} 条）",
                 style="ModeSel.TButton",
                 command=self._load_more,
-            ).pack(side=tk.LEFT)
+            )
+            ToolTip(load_more_btn, "在当前列表末尾追加一页候选")
+            load_more_btn.pack(side=tk.LEFT)
         else:
             ttk.Label(self.pager_frame, text="已全部加载",
                       style="Hint.TLabel").pack(side=tk.LEFT)
@@ -1824,11 +2713,25 @@ class App(tk.Tk):
         self.update()
 
     def _toast(self, msg: str):
-        # 没有专门 toast，用状态栏续命
-        prev = self.status_label.cget("text")
+        """状态栏 toast：✓ 文案停留 1.8s 后恢复常规状态。
+
+        恢复不走弹出时的文本快照——旧实现会把 toast 期间发生的正常状态
+        更新覆盖回旧值，且连续 toast 各自排期、相互闪断。改为到期直接调
+        _refresh_status() 重算当前真实状态；连续 toast 只保留最后一个到期
+        回调（防抖）。同时承担极简模式的操作反馈（#11）。
+        """
+        if self._toast_after is not None:
+            try:
+                self.after_cancel(self._toast_after)
+            except Exception:
+                pass
         self.status_label.configure(text=f"✓ {msg}")
-        self.after(1800, lambda: self.status_label.configure(text=prev))
-        # 同时写一份 last_query 方便用户从状态栏看出最近动作
+        self._toast_after = self.after(1800, self._toast_reset)
+
+    def _toast_reset(self):
+        """toast 到期：按当前真实状态重算状态栏文案（模式/条数/紧凑态）。"""
+        self._toast_after = None
+        self._refresh_status()
 
     # ---------------- 数据导入导出 ----------------
 
