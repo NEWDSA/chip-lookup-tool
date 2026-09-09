@@ -1334,10 +1334,19 @@ class App(tk.Tk):
     def _bind_global_keys(self):
         self.bind("<Up>", self._on_arrow_up)
         self.bind("<Down>", self._on_arrow_down)
-        self.bind("<Control-c>", lambda e: self._copy_part_no())
-        self.bind("<Control-C>", lambda e: self._copy_part_no())
+        self.bind("<Control-c>", self._on_ctrl_c)
+        self.bind("<Control-C>", self._on_ctrl_c)
         self.bind("<Escape>", self._on_escape)
         self.bind("<F5>", lambda e: self._reload_db())
+
+    def _on_ctrl_c(self, event):
+        """Ctrl+C处理：如果焦点在Text控件上，允许原生复制；否则复制料号。"""
+        widget = event.widget
+        # 检查是否是Text控件（disabled状态也允许选择和复制）
+        if isinstance(widget, tk.Text):
+            return  # 允许原生复制行为
+        # 其他情况复制料号
+        self._copy_part_no()
 
     def _refresh_status(self):
         """状态栏主文案三态（#5 响应式 + #8 去重）：
@@ -2627,12 +2636,14 @@ class App(tk.Tk):
         if cw <= 0:
             return
         for val, lab in self._detail_value_labels:
-            try:
-                lw = lab.winfo_reqwidth()
-            except Exception:
-                lw = 158
-            # 卡片左右内边距各 20px，再加 12px 视觉余量
-            val.configure(wraplength=max(120, cw - 40 - lw - 12))
+            # Text控件根据宽度自动换行，无需额外设置
+            # 保留方法以兼容可能的Label控件
+            if not isinstance(val, tk.Text):
+                try:
+                    lw = lab.winfo_reqwidth()
+                except Exception:
+                    lw = 158
+                val.configure(wraplength=max(120, cw - 40 - lw - 12))
 
     def _refresh_pager(self):
         """刷新加载更多模式下的 pager 控件。"""
@@ -2900,11 +2911,15 @@ class App(tk.Tk):
                 lab = ttk.Label(row, text=label, style="Field.TLabel", width=10, anchor="w")
                 lab.pack(side=tk.LEFT)
                 ToolTip(lab, en)  # 英文全称悬停可见（#17）
-                val = ttk.Label(
-                    row, text=display,
-                    style="DimValue.TLabel" if is_empty else "Value.TLabel",
-                    anchor="w", justify="left",
+                val = tk.Text(
+                    row, height=1, wrap="word",
+                    font=("Microsoft YaHei UI", 11, "bold") if not is_empty else ("Microsoft YaHei UI", 11),
+                    bg=COLOR_CARD, fg=COLOR_TEXT if not is_empty else COLOR_TEXT_DIM,
+                    relief="flat", bd=0, highlightthickness=0,
+                    padx=0, pady=0, spacing1=0, spacing3=0,
                 )
+                val.insert("1.0", display)
+                val.configure(state="disabled")
                 val.pack(side=tk.LEFT, fill=tk.X, expand=True)
                 # 记录字段值，随窗口缩放自适应换行（详情区宽度变化时统一刷新）
                 self._detail_value_labels.append((val, lab))
