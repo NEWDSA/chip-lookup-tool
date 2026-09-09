@@ -197,11 +197,11 @@ class MinimalModeTests(unittest.TestCase):
         app._on_escape()
         pump(app, 300)
         self.assert_full_mode(app)
-        # 完整模式下 Esc 仍是清空查询，且不再切模式
+        # 完整模式下 Esc 进入极简模式（切换行为），不清空查询
         app.var_query.set("abc")
         app._on_escape()
-        self.assertEqual(app.var_query.get(), "")
-        self.assertFalse(app._minimal_mode)
+        self.assertTrue(app._minimal_mode)
+        self.assertEqual(app.var_query.get(), "abc")
 
 
 if __name__ == "__main__":

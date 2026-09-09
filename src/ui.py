@@ -573,6 +573,7 @@ class App(tk.Tk):
         # 屏下布局比例与 96 DPI 一致（字体是 pt 单位，Tk 按 scaling 自动缩放）。
         self._ui_scale = self._compute_ui_scale() * self._zoom_factor()
         self.title(f"ChipLookup v{APP_VERSION} · 芯片料号查询器")
+        self._set_window_icon()
         # #5：minsize 1000x680 → 720x560 —— 1080p@125% 半屏（逻辑 768 宽）可贴靠，
         # 「左资料右查询」的分屏工作流可用；窄窗可用性由状态栏三态折叠（#5）+
         # 底栏低频项收纳（#9）保证
@@ -681,6 +682,16 @@ class App(tk.Tk):
             return round(f * 40) / 40.0
         except Exception:
             return 1.0
+
+    def _set_window_icon(self):
+        """设置窗口图标（标题栏 + 任务栏）。打包后从 _MEIPASS 读取，开发模式从项目根读取。"""
+        from paths import bundle_root
+        icon_path = os.path.join(bundle_root(), "installer", "chip_lookup.ico")
+        if os.path.isfile(icon_path):
+            try:
+                self.iconbitmap(icon_path)
+            except tk.TclError:
+                pass
 
     def _s(self, px) -> int:
         """逻辑像素 → 物理像素（按显示器 DPI 缩放，见 _compute_ui_scale）。"""
@@ -1590,14 +1601,11 @@ class App(tk.Tk):
         self._run_query()
 
     def _on_escape(self, event=None):
-        """Esc：极简模式下先退出极简；否则清空查询输入。
+        """Esc：切换极简/完整模式。
 
         输入框与顶层都绑定本方法并返回 "break"，避免一次按键触发两处。
         """
-        if self._minimal_mode:
-            self._set_minimal_mode(False)
-            return "break"
-        self._clear_query()
+        self._set_minimal_mode(not self._minimal_mode)
         return "break"
 
     def _on_enter(self):

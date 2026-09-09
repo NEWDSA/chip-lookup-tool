@@ -36,6 +36,9 @@ a = Analysis(
         # 规则快照：src/fdnext/data/fdnext-core-3.2.0/*.json → _MEIPASS/fdnext/data/fdnext-core-3.2.0/
         (os.path.join(PROJECT_ROOT, 'src', 'fdnext', 'data'),
          'fdnext/data'),
+        # 窗口图标：运行时 _set_window_icon() 从 _MEIPASS/installer/ 读取
+        (os.path.join(PROJECT_ROOT, 'installer', 'chip_lookup.ico'),
+         os.path.join('installer', 'chip_lookup.ico')),
         # tools/ 整目录打包进 _MEIPASS/tools/，作为运行时兜底：
         # src/fdnext/indexes.py 历史曾从 tools/sync_upstream import 常量，
         # 迁移到 fdnext.upstream_common 后该 import 已消除，但保留打包避免
