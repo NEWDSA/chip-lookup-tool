@@ -1,10 +1,10 @@
 {
-  "mode": "local",
+  "mode": "upstream",
   "csv_path": "e:\\study\\zhicun\\chip-lookup-tool\\data\\chip_database.csv",
   "hybrid_priority": "local_first",
   "minimal_mode": true,
-  "window_size": "863x604",
-  "window_pos": "+759+146",
+  "window_size": "720x560",
+  "window_pos": "+674+159",
   "ui_zoom": 0.85,
   "upstream_offline": false,
   "upstream_refresh": false,
