@@ -8,7 +8,7 @@ chip_lookup.main
     python -m chip_lookup (假设已 PYTHONPATH=src)
 
 支持三种运行模式（--mode / chiplookup.json 配置）：
-    local     本地 CSV
+    local     本地数据
     upstream  上游数据源
     hybrid    混合（本地 + 上游）
 """
@@ -39,7 +39,7 @@ from ui import run as run_ui  # noqa: E402
 
 def _parse_args():
     parser = argparse.ArgumentParser(
-        description="ChipLookup - 跨平台芯片料号查询器（支持本地CSV/上游/混合三种模式）",
+        description="ChipLookup - 跨平台芯片料号查询器（支持本地数据/上游/混合三种模式）",
     )
     add_arguments(parser)
     parser.add_argument(

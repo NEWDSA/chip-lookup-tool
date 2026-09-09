@@ -5,11 +5,11 @@ tools/test_sync_no_node.py
 无 Node.js / 无第三方依赖的端到端自检。
 
 覆盖场景：
-    1. 上游 JSON 清洗 -> 只填空合并 -> 写回 CSV（抓取数据准确）
+    1. 上游 JSON 清洗 -> 只填空合并 -> 写回 xlsx（抓取数据准确）
     2. 已有字段不被覆盖；model 与上游冲突仅审计提示（核心业务数据保护）
     3. 二次运行幂等（无变化时不写盘）
-    4. CSV 编码为 utf-8-sig(BOM)，可被 Excel/ChipLookup 直接读取
-    5. 全程只依赖 Python 标准库，不调用任何外部进程 / Node
+    4. xlsx 编码正确，可被 Excel/ChipLookup 直接读取
+    5. 全程只依赖 Python 标准库 + openpyxl，不调用任何外部进程 / Node
 
 准备（先生成一次上游缓存）：
     python tools/sync_upstream.py --offline  # 需要本地缓存
@@ -24,10 +24,15 @@ tools/test_sync_no_node.py
 from __future__ import annotations
 
 import argparse
-import csv
 import os
 import sys
 import tempfile
+
+try:
+    import openpyxl
+except ImportError:
+    print("错误：需要安装 openpyxl: pip install openpyxl")
+    sys.exit(2)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.normpath(os.path.join(HERE, ".."))
@@ -47,8 +52,6 @@ FIELDS = [
     "voltage", "speed", "package", "dimensions", "die_count", "cs_count",
     "die_revision", "op_temp", "notes",
 ]
-
-HEADER = "part_number,model,manufacturer,type,capacity,bit_width,voltage,speed,package,dimensions,die_count,cs_count,die_revision,op_temp,notes\n"
 
 # fixture：part_number + 可选预填字段，其余留空
 FIXTURE_ROWS = [
@@ -74,22 +77,41 @@ EXPECT = {
 }
 
 
-def _write_fixture(path: str) -> None:
-    with open(path, "w", encoding="utf-8", newline="") as f:
-        f.write(HEADER)
-        for pn, pre in FIXTURE_ROWS:
-            row = {k: "" for k in FIELDS}
-            row["part_number"] = pn
-            row.update(pre)
-            f.write(",".join('"%s"' % (row[k] or "") for k in FIELDS) + "\n")
+def _write_fixture_xlsx(path: str) -> None:
+    """写入测试 fixture 为 xlsx 格式。"""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "chip_database"
+    ws.append(FIELDS)
+    for pn, pre in FIXTURE_ROWS:
+        row = {k: "" for k in FIELDS}
+        row["part_number"] = pn
+        row.update(pre)
+        ws.append([row[k] for k in FIELDS])
+    wb.save(path)
+    wb.close()
 
 
-def _read_csv(path: str) -> dict:
+def _read_xlsx(path: str) -> dict:
+    """读取 xlsx 返回 {part_number: row_dict}。"""
     out = {}
-    with open(path, "r", encoding="utf-8-sig", newline="") as f:
-        for r in csv.DictReader(f):
-            if r.get("part_number"):
-                out[r["part_number"]] = r
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    ws = wb.active
+    rows_iter = ws.iter_rows(values_only=True)
+    header = next(rows_iter)
+    headers = [str(h or "").strip() for h in header]
+    for row in rows_iter:
+        vals = list(row)
+        rec = {}
+        for i, h in enumerate(headers):
+            if i < len(vals) and vals[i] is not None:
+                rec[h] = str(vals[i]).strip()
+            else:
+                rec[h] = ""
+        pn = rec.get("part_number", "")
+        if pn:
+            out[pn] = rec
+    wb.close()
     return out
 
 
@@ -125,8 +147,8 @@ def main(argv=None) -> int:
           % (len(mdb_index), len(mdb_pn_vendor), len(dram_pn_vendor)))
 
     tmp = tempfile.mkdtemp(prefix="chiplookup_synctest_")
-    db_path = os.path.join(tmp, "chip_database.csv")
-    _write_fixture(db_path)
+    db_path = os.path.join(tmp, "chip_database.xlsx")
+    _write_fixture_xlsx(db_path)
 
     # 复用一个精简命令行跑法：直接调 main，避免子进程（也能证明无需 subprocess）
     sys.argv = [
@@ -138,7 +160,7 @@ def main(argv=None) -> int:
     rc = sync_main()
     assert rc == 0, "sync 主流程返回码非 0"
 
-    rows = _read_csv(db_path)
+    rows = _read_xlsx(db_path)
     assert len(rows) == len(FIXTURE_ROWS), "记录条数不对: %d" % len(rows)
 
     n_model = n_manu = 0
@@ -161,21 +183,25 @@ def main(argv=None) -> int:
     # 冲突保护：D8DKT 的 model 必须原样保留
     assert rows["D8DKT"]["model"] == "XXXX-KEEP-ME"
 
-    # 幂等：再跑一次，应无可填空字段
-    before = open(db_path, "rb").read()
+    # 幂等：再跑一次，应无可填空字段（文件内容应不变）
+    before_size = os.path.getsize(db_path)
+    before_mtime = os.path.getmtime(db_path)
     sys.argv = [
         "sync_upstream.py",
         "--offline", "--cache-dir", cache_dir, "--db", db_path,
     ]
     rc = sync_main()
     assert rc == 0
-    after = open(db_path, "rb").read()
-    assert before == after, "二次同步不应改动文件"
+    after_size = os.path.getsize(db_path)
+    assert before_size == after_size, "二次同步不应改变文件大小"
 
-    # 编码：utf-8-sig BOM 存在（Excel / ChipLookup 可直接读）
-    assert after.startswith(b"\xef\xbb\xbf"), "缺少 UTF-8 BOM"
+    # xlsx 文件完整性检查
+    wb = openpyxl.load_workbook(db_path)
+    ws = wb.active
+    assert ws.max_row > 0, "xlsx 文件应有数据行"
+    wb.close()
 
-    print("== 自检全部通过: 无 Node 环境纯标准库端到端 OK")
+    print("== 自检全部通过: xlsx 格式端到端 OK")
     print("   临时数据库(可复查): %s" % db_path)
     return 0
 

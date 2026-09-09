@@ -4,7 +4,7 @@ chip_lookup.paths
 -----------------
 定位「数据文件」和「默认数据库」位置。
 根据运行环境自动判断：
-    1) 用户级（exe 旁边的 chip_database.csv）     -- 持久、可读写
+    1) 用户级（exe 旁边的 chip_database.xlsx）     -- 持久、可读写
     2) exe 内嵌（PyInstaller _MEIPASS/data/...）  -- 只读，作为初始种子
     3) 开发模式（源码 src/ 的 ../data/...）
 
@@ -36,7 +36,7 @@ def bundle_root() -> str:
     return program_root()
 
 
-def resolve_database_path(filename: str = "chip_database.csv") -> Tuple[str, bool]:
+def resolve_database_path(filename: str = "chip_database.xlsx") -> Tuple[str, bool]:
     """
     返回 (数据库绝对路径, 是否用户级可写)。
     优先级：
@@ -56,10 +56,10 @@ def resolve_database_path(filename: str = "chip_database.csv") -> Tuple[str, boo
     return user_path, True  # 还没有，让调用方去 seed
 
 
-def ensure_user_database(filename: str = "chip_database.csv") -> str:
+def ensure_user_database(filename: str = "chip_database.xlsx") -> str:
     """
     保证用户级数据库存在。如不存在，把 bundle 内的种子拷一份过去；
-    都不存在则创建一个只含表头的空 CSV。
+    都不存在则创建一个只含表头的空 xlsx。
     返回最终的可写数据库绝对路径。
     """
     user_path = os.path.join(program_root(), "data", filename)
@@ -72,9 +72,6 @@ def ensure_user_database(filename: str = "chip_database.csv") -> str:
     if os.path.exists(bundle_path):
         shutil.copyfile(bundle_path, user_path)
     else:
-        from .database import DEFAULT_FIELDS  # 延迟 import，避免循环
-        import csv
-        with open(user_path, "w", encoding="utf-8-sig", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=DEFAULT_FIELDS)
-            writer.writeheader()
+        from .database import DEFAULT_FIELDS, _write_xlsx  # 延迟 import，避免循环
+        _write_xlsx(user_path, [])
     return user_path

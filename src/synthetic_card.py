@@ -205,10 +205,10 @@ if __name__ == "__main__":
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from database import ChipDatabase
     here = os.path.dirname(os.path.abspath(__file__))
-    default_csv = os.path.normpath(os.path.join(here, "..", "data", "chip_database.csv"))
+    default_csv = os.path.normpath(os.path.join(here, "..", "data", "chip_database.xlsx"))
     default_out = os.path.normpath(os.path.join(here, "..", "screenshots"))
 
-    parser = argparse.ArgumentParser(description="根据 CSV 记录画一张完整 detail 卡片 PNG")
+    parser = argparse.ArgumentParser(description="根据数据记录画一张完整 detail 卡片 PNG")
     parser.add_argument("--db", default=default_csv)
     parser.add_argument("--out-dir", default=default_out)
     parser.add_argument("--part", action="append", help="要画哪几条料号（可多次）；不传则画前 2 条")

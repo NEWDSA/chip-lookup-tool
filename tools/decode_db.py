@@ -224,7 +224,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--db", default=None,
-                        help="目标 CSV 数据库，默认 data/chip_database.csv")
+                        help="目标数据库，默认 data/chip_database.xlsx")
     parser.add_argument("--write", action="store_true",
                         help="写回 CSV（默认 dry-run 只预览）")
     parser.add_argument("--verbose", action="store_true",

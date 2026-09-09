@@ -1,7 +1,10 @@
-# ChipLookup 仅依赖 Python 标准库（tkinter, sqlite3, csv, json, difflib）
-# 下面两项仅为可选 / 调试用：
+# ChipLookup 依赖 Python 标准库（tkinter, csv, json, difflib）+ openpyxl
+# 下面几项为可选 / 调试用：
 #   pillow：仅 src/ui.py 的 --screenshot 截图调试功能需要
 #   pyinstaller：打包成单文件 exe 用，可选
+
+# xlsx 读写（数据库默认格式）
+openpyxl>=3.1.0
 
 # 调试截图功能
 pillow>=10.0.0

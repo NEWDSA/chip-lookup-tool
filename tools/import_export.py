@@ -113,7 +113,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--db",
-        help="CSV 数据库路径，默认 data/chip_database.csv",
+        help="数据库路径，默认 data/chip_database.xlsx",
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 

@@ -52,7 +52,7 @@ class RecordSource:
     """数据源统一接口。子类实现各自的加载方式。"""
 
     MODE = MODE_LOCAL
-    LABEL = "本地CSV"
+    LABEL = "本地数据"
 
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -87,10 +87,10 @@ class RecordSource:
         return False
 
     def import_csv(self, path: str, replace: bool = False) -> int:
-        raise SourceUnsupportedError("%s 模式不支持导入 CSV" % self.LABEL)
+        raise SourceUnsupportedError("%s 模式不支持导入" % self.LABEL)
 
     def export_csv(self, path: str) -> int:
-        raise SourceUnsupportedError("%s 模式不支持导出 CSV" % self.LABEL)
+        raise SourceUnsupportedError("%s 模式不支持导出" % self.LABEL)
 
 
 # ---------------------------------------------------------------------------
@@ -102,7 +102,7 @@ class LocalSource(RecordSource):
     """只读取本地 CSV；不触发任何上游调用。"""
 
     MODE = MODE_LOCAL
-    LABEL = "本地CSV"
+    LABEL = "本地数据"
 
     def __init__(self, settings: Settings):
         super().__init__(settings)

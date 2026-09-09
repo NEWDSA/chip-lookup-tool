@@ -5,8 +5,8 @@ chip_lookup.config
 运行模式与数据源配置层。
 
 三种运行模式：
-    local     本地 CSV 模式   —— 仅读取本地 CSV，屏蔽上游
-    upstream  上游数据源模式  —— 仅从上游索引拉取，关闭本地 CSV
+    local     本地数据模式   —— 仅读取本地数据，屏蔽上游
+    upstream  上游数据源模式  —— 仅从上游索引拉取，关闭本地数据
     hybrid    混合模式        —— 本地 + 上游融合检索
 
 配置来源与优先级（高的覆盖低的）：
@@ -39,7 +39,7 @@ MODE_HYBRID = "hybrid"
 MODES = (MODE_LOCAL, MODE_UPSTREAM, MODE_HYBRID)
 
 MODE_LABELS = {
-    MODE_LOCAL: "本地CSV",
+    MODE_LOCAL: "本地数据",
     MODE_UPSTREAM: "网络",  # 上游数据源统一以「网络」命名（internal 仍为 upstream）
     MODE_HYBRID: "混合",
 }
@@ -193,7 +193,7 @@ class Settings:
         """规范化非法取值：模式回退本地、优先级回退默认。"""
         if self.mode not in MODES:
             self.warnings.append(
-                "模式 %r 无效，已回退为本地CSV" % (self.mode,)
+                "模式 %r 无效，已回退为本地数据" % (self.mode,)
             )
             self.mode = MODE_LOCAL
         if self.hybrid_priority not in HYBRID_PRIORITIES:
@@ -279,7 +279,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     """往命令行解析器追加模式/数据源相关参数。"""
     parser.add_argument(
         "--mode", choices=MODES, default=None,
-        help="运行模式：local 本地CSV / upstream 上游 / hybrid 混合"
+        help="运行模式：local 本地数据 / upstream 上游 / hybrid 混合"
              "（默认读配置文件，未配置时为 local）",
     )
     parser.add_argument(
@@ -288,7 +288,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--db", default=None,
-        help="CSV 数据库路径（本地/混合模式；默认自动定位）",
+        help="数据库路径（本地/混合模式；默认自动定位）",
     )
     parser.add_argument(
         "--hybrid-priority", choices=HYBRID_PRIORITIES, default=None,

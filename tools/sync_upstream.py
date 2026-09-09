@@ -21,7 +21,7 @@ tools/sync_upstream.py
     python tools/sync_upstream.py                     # 在线同步到默认库
     python tools/sync_upstream.py --dry-run           # 只预览，不改盘
     python tools/sync_upstream.py --offline           # 只用本地缓存（无网/CI）
-    python tools/sync_upstream.py --db <other.csv>    # 指定目标库
+    python tools/sync_upstream.py --db <other.xlsx>    # 指定目标库
     python tools/sync_upstream.py --export-index mdb_clean.csv
 """
 
@@ -448,7 +448,7 @@ def main(argv=None) -> int:
         description="ChipLookup 上游数据同步器（纯 Python，无 Node.js 依赖）",
     )
     parser.add_argument("--db", default=None,
-                        help="目标 CSV 数据库，默认 data/chip_database.csv")
+                        help="目标数据库，默认 data/chip_database.xlsx")
     parser.add_argument("--cache-dir", default=None,
                         help="上游 JSON 缓存目录（默认平台用户缓存）")
     parser.add_argument("--offline", action="store_true",

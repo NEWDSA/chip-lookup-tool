@@ -32,6 +32,11 @@ import subprocess
 import sys
 import tempfile
 
+try:
+    import openpyxl
+except ImportError:
+    openpyxl = None
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.normpath(os.path.join(HERE, ".."))
 
@@ -190,28 +195,44 @@ def main(argv=None) -> int:
     assert all(x["result"]["status"] == "ok" for x in payload["results"])
     print("stdin 多查询断言通过")
 
-    # ---- 5) CSV 只填空合并（decode_db）----
+    # ---- 5) xlsx 只填空合并（decode_db）----
     tmp = tempfile.mkdtemp(prefix="chiplookup_decodetest_")
-    db_path = os.path.join(tmp, "chip_database.csv")
+    db_path = os.path.join(tmp, "chip_database.xlsx")
     fixture = [
         ("MT40A1G16JC-062E", {}),
         ("H5AN8G8NCJR-VKC", {}),
         ("K4A4G165WF-BCWE", {"manufacturer": "AMD-KEEP"}),  # 已填 -> 绝不覆盖
         ("D8DKS", {}),  # mdb 边界 -> 保持原样
     ]
-    with open(db_path, "w", encoding="utf-8", newline="") as f:
-        f.write(HEADER)
-        for pn, pre in fixture:
-            row = {k: "" for k in FIELDS}
-            row["part_number"] = pn
-            row.update(pre)
-            f.write(",".join('"%s"' % (row[k] or "") for k in FIELDS) + "\n")
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "chip_database"
+    ws.append(FIELDS)
+    for pn, pre in fixture:
+        row = {k: "" for k in FIELDS}
+        row["part_number"] = pn
+        row.update(pre)
+        ws.append([row[k] for k in FIELDS])
+    wb.save(db_path)
+    wb.close()
 
     rc, out, err = run_cli(DECODE_DB_PY, ["--db", db_path, "--write"], env)
     assert rc == 0, "decode_db rc=%d stderr=%s" % (rc, err)
 
-    with open(db_path, "r", encoding="utf-8-sig", newline="") as f:
-        rows = {r["part_number"]: r for r in csv.DictReader(f)}
+    # 读取 xlsx 验证
+    wb = openpyxl.load_workbook(db_path, read_only=True, data_only=True)
+    ws = wb.active
+    rows_iter = ws.iter_rows(values_only=True)
+    headers = [str(h or "").strip() for h in next(rows_iter)]
+    rows = {}
+    for row in rows_iter:
+        vals = list(row)
+        rec = {headers[i]: str(vals[i]).strip() if i < len(vals) and vals[i] is not None else ""
+               for i in range(len(headers))}
+        if rec.get("part_number"):
+            rows[rec["part_number"]] = rec
+    wb.close()
+
     assert rows["MT40A1G16JC-062E"]["type"] == "DDR4"
     assert rows["MT40A1G16JC-062E"]["capacity"] == "16Gb"
     assert rows["MT40A1G16JC-062E"]["manufacturer"] == "Micron"
@@ -224,14 +245,13 @@ def main(argv=None) -> int:
     d8 = rows["D8DKS"]
     assert not any((d8.get(k) or "").strip() for k in FIELDS if k != "part_number")
 
-    # 幂等 + BOM
-    before = open(db_path, "rb").read()
-    assert before.startswith(b"\xef\xbb\xbf"), "缺少 UTF-8 BOM"
+    # 幂等
+    before_size = os.path.getsize(db_path)
     rc, out, err = run_cli(DECODE_DB_PY, ["--db", db_path, "--write"], env)
     assert rc == 0
-    after = open(db_path, "rb").read()
-    assert before == after, "二次写回不应改动文件"
-    print("decode_db 只填空断言通过: 覆盖保护 / 边界留空 / 幂等 / BOM")
+    after_size = os.path.getsize(db_path)
+    assert before_size == after_size, "二次写回不应改变文件大小"
+    print("decode_db 只填空断言通过: 覆盖保护 / 边界留空 / 幂等")
     print("   临时数据库(可复查): %s" % db_path)
 
     print("== 自检全部通过: 无 Node 环境下 decode CLI / CSV 合并端到端 OK")

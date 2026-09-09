@@ -458,15 +458,25 @@ def _create_tip_window(master: tk.Widget, text: str) -> tk.Toplevel:
     return tip
 
 
-def _place_tip_window(tip: Optional[tk.Toplevel]):
-    """气泡定位在指针右下方；右/下贴边时往屏内收（#7 屏幕边缘收敛）。"""
+def _place_tip_window(tip: Optional[tk.Toplevel],
+                      widget: Optional[tk.Widget] = None):
+    """气泡定位：优先在控件正上方；右/上贴边时往屏内收（#7 屏幕边缘收敛）。"""
     if tip is None:
         return
     try:
         tip.update_idletasks()
         w, h = tip.winfo_reqwidth(), tip.winfo_reqheight()
-        px = tip.winfo_pointerx() + 14
-        py = tip.winfo_pointery() + 20
+        if widget is not None:
+            # 相对控件定位：水平居中，垂直在控件上方
+            wx = widget.winfo_rootx()
+            wy = widget.winfo_rooty()
+            ww = widget.winfo_width()
+            px = wx + ww // 2 - w // 2
+            py = wy - h - 2
+        else:
+            # 无控件时 fallback 到指针位置
+            px = tip.winfo_pointerx() + 14
+            py = tip.winfo_pointery() + 20
         sw, sh = tip.winfo_screenwidth(), tip.winfo_screenheight()
         x = max(0, min(px, sw - w - 8))
         y = max(0, min(py, sh - h - 8))
@@ -505,7 +515,7 @@ class ToolTip:
         if self._tip is not None:
             try:
                 self._tip_label.configure(text=text)
-                _place_tip_window(self._tip)
+                _place_tip_window(self._tip, self._widget)
             except tk.TclError:
                 pass
 
@@ -547,12 +557,12 @@ class ToolTip:
             return
         self._tip = _create_tip_window(self._widget, self._text)
         self._tip_label = self._tip.winfo_children()[0]
-        _place_tip_window(self._tip)
+        _place_tip_window(self._tip, self._widget)
 
 
 # 数据源模式悬停说明（#7 tooltip 体系）：radio 上只放得下短标签，差异在这里说清
 _SOURCE_MODE_HINTS = {
-    "local": "读取本地 CSV 文件，离线可用",
+    "local": "读取本地数据文件，离线可用",
     "upstream": "从上游网络接口拉取数据（需联网，首次构建较慢）",
     "hybrid": "本地 + 网络合并查询（首次构建较慢）",
 }
@@ -920,7 +930,7 @@ class App(tk.Tk):
         )
         self.btn_sync.pack(side=tk.LEFT, padx=(12, 0))
         ToolTip(self.btn_sync,
-                "从上游索引（fdnext）拉取最新数据并合并到本地 CSV，仅填空不覆盖已有字段")
+                "从上游索引（fdnext）拉取最新数据并合并到本地库，仅填空不覆盖已有字段")
         self.status_label = ttk.Label(top, text="", style="Status.TLabel")
         self.status_label.pack(side=tk.LEFT, padx=(24, 0))
         # 常驻文案只放「模式 · 条数」（#8 去重）；数据源完整描述（LABEL · 文件名）
@@ -1171,14 +1181,14 @@ class App(tk.Tk):
 
         more_btn = ttk.Menubutton(bottom, text="更多 ⋯", style="Ghost.TButton")
         more_btn.pack(side=tk.LEFT, padx=(0, 6))
-        ToolTip(more_btn, "导入/导出 CSV、刷新数据、界面缩放、关于")
+        ToolTip(more_btn, "导入/导出 xlsx、刷新数据、界面缩放、关于")
         # 深色菜单（与主题一致；tearoff=0 去掉 Win 的可撕离虚线）
         more_menu = tk.Menu(
             more_btn, tearoff=0, bg=COLOR_CARD, fg=COLOR_TEXT,
             activebackground=COLOR_CARD_HOVER, activeforeground=COLOR_TEXT, bd=1,
         )
-        more_menu.add_command(label="导入 CSV…", command=self._import_csv)
-        more_menu.add_command(label="导出 CSV…", command=self._export_csv)
+        more_menu.add_command(label="导入 xlsx…", command=self._import_csv)
+        more_menu.add_command(label="导出 xlsx…", command=self._export_csv)
         more_menu.add_separator()
         more_menu.add_command(label="刷新数据", accelerator="F5", command=self._reload_db)
         more_menu.add_separator()
@@ -2428,7 +2438,7 @@ class App(tk.Tk):
         messagebox.showinfo(
             "关于 ChipLookup",
             f"ChipLookup v{APP_VERSION}\n"
-            "芯片料号查询器（本地 CSV / 网络数据源 / 混合检索）\n\n"
+            "芯片料号查询器（本地数据 / 网络数据源 / 混合检索）\n\n"
             f"当前模式：{MODE_LABELS.get(self.settings.mode, self.settings.mode)}"
             f" · 共 {self.source.count()} 条记录\n"
             f"数据源：{self.source.describe()}",
@@ -2818,7 +2828,7 @@ class App(tk.Tk):
                   style="Card.TLabel", font=("Microsoft YaHei UI", 10, "bold")).pack(anchor="w", pady=(0, 6))
         ttk.Label(advice, text="• 试着只输入前几位或后几位字母\n"
                   "• 核对料号来源文档\n"
-                  "• 用 「导入 CSV」 把新批次料号纳入数据库\n"
+                  "• 用 「导入 xlsx」 把新批次料号纳入数据库\n"
                   "• 命令行直接维护：python tools/import_export.py add <料号> <型号>",
                   style="Card.TLabel",
                   justify="left").pack(anchor="w")
@@ -2972,11 +2982,11 @@ class App(tk.Tk):
 
     def _import_csv(self):
         if not self.source.supports_import():
-            self._toast("当前模式（%s）不支持导入 CSV" % self.source.LABEL)
+            self._toast("当前模式（%s）不支持导入" % self.source.LABEL)
             return
         path = filedialog.askopenfilename(
-            title="导入 CSV（合并到现有库）",
-            filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")],
+            title="导入数据（合并到现有库）",
+            filetypes=[("Excel 文件", "*.xlsx"), ("CSV 文件", "*.csv"), ("所有文件", "*.*")],
         )
         if not path:
             return
@@ -2985,14 +2995,25 @@ class App(tk.Tk):
         except Exception as exc:
             messagebox.showerror("导入失败", str(exc))
             return
-        # CSV 已变化：所有读取该 CSV 的模式缓存全部失效（import_csv 已就地
+        # 数据已变化：所有读取该文件的模式缓存全部失效（import_csv 已就地
         # reload 当前 source，把它重新放回缓存即可；其余模式下次切换再重建）
         self._source_cache.clear()
         self._source_cache[self.settings.mode] = self.source
         # 重新加载缓存
         self._records_cache = self.source.list_records()
         self._refresh_status()
-        self._toast(f"导入 {n} 条")
+        # 明确反馈：弹窗告知导入结果
+        basename = os.path.basename(path)
+        if n > 0:
+            messagebox.showinfo(
+                "导入成功",
+                "文件：%s\n导入 %d 条记录（新增 + 更新）" % (basename, n),
+            )
+        else:
+            messagebox.showinfo(
+                "导入完成",
+                "文件：%s\n所有记录已存在，无新增或更新" % basename,
+            )
         if self.var_query.get().strip():
             self._run_query()
         if self.on_change:
@@ -3000,13 +3021,13 @@ class App(tk.Tk):
 
     def _export_csv(self):
         if not self.source.supports_export():
-            self._toast("当前模式（%s）不支持导出 CSV" % self.source.LABEL)
+            self._toast("当前模式（%s）不支持导出" % self.source.LABEL)
             return
         path = filedialog.asksaveasfilename(
-            title="导出 CSV",
-            defaultextension=".csv",
-            initialfile="chip_database_export.csv",
-            filetypes=[("CSV 文件", "*.csv")],
+            title="导出数据",
+            defaultextension=".xlsx",
+            initialfile="chip_database_export.xlsx",
+            filetypes=[("Excel 文件", "*.xlsx"), ("CSV 文件", "*.csv")],
         )
         if not path:
             return
