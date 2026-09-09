@@ -24,3 +24,6 @@ dist/*.log
 .vscode/
 .idea/
 build
+dist_installer
+dist
+.workbuddy

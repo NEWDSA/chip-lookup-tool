@@ -143,6 +143,10 @@ class Settings:
     minimal_mode: bool = False
     # 主窗口尺寸记忆（"宽x高"，如 "1150x780"；None=从未手动调整过，用默认尺寸）
     window_size: Optional[str] = None
+    # 主窗口位置记忆（"+x+y"；恢复时按屏幕边界收敛，防止换显示器后窗口丢失）
+    window_pos: Optional[str] = None
+    # 界面缩放系数（乘在 DPI 因子上，0.8~1.6；改动保存后重启生效）
+    ui_zoom: float = 1.0
     # 网络类型参数（原「上游」类型；键名保持 upstream_* 兼容既有配置）
     upstream_offline: bool = False
     upstream_refresh: bool = False
@@ -161,6 +165,7 @@ class Settings:
     # 通用运行参数 + 网络类型参数（键名与 NETWORK_PARAMS 一致，兼容历史配置）
     _SERIALIZED = (
         "mode", "csv_path", "hybrid_priority", "minimal_mode", "window_size",
+        "window_pos", "ui_zoom",
     ) + NETWORK_PARAMS
 
     def to_dict(self) -> dict:
@@ -218,6 +223,28 @@ class Settings:
                     "窗口尺寸 %r 无效，已忽略" % (self.window_size,)
                 )
                 self.window_size = None
+        if self.window_pos is not None:
+            ok = False
+            try:
+                x, y = str(self.window_pos).lstrip("+").split("+", 1)
+                ok = int(x) >= 0 and int(y) >= 0
+            except (ValueError, AttributeError):
+                ok = False
+            if not ok:
+                self.warnings.append(
+                    "窗口位置 %r 无效，已忽略" % (self.window_pos,)
+                )
+                self.window_pos = None
+        try:
+            z = float(self.ui_zoom)
+        except (TypeError, ValueError):
+            z = 1.0
+        if not 0.8 <= z <= 1.6:
+            self.warnings.append(
+                "界面缩放 %r 超出范围（0.8~1.6），已回退 1.0" % (self.ui_zoom,)
+            )
+            z = 1.0
+        self.ui_zoom = z
 
     @staticmethod
     def _coerce(key: str, value) -> object:
@@ -236,6 +263,10 @@ class Settings:
             return str(value or "") or None
         if key == "window_size":
             return str(value or "") or None
+        if key == "window_pos":
+            return str(value or "") or None
+        if key == "ui_zoom":
+            return float(value)
         return str(value)
 
 

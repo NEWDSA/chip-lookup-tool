@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -95,13 +96,13 @@ class WindowSizeTests(unittest.TestCase):
             app2.destroy()
 
     def test_size_clamped_to_minsize(self):
-        """保存的尺寸小于 minsize 时收敛到 1000x680。"""
+        """保存的尺寸小于 minsize 时收敛到 720x560（#5 降档后的新下限）。"""
         s = make_settings(self.cfg, window_size="500x400")
         app = App(s, LocalSource(s))
         try:
             pump(app, 800)
-            self.assertEqual(app.winfo_width(), 1000)
-            self.assertEqual(app.winfo_height(), 680)
+            self.assertEqual(app.winfo_width(), 720)
+            self.assertEqual(app.winfo_height(), 560)
         finally:
             app.destroy()
 
@@ -154,9 +155,8 @@ class WindowSizeTests(unittest.TestCase):
     def test_dpi_save_stores_logical(self):
         """DPI 125%：物理尺寸写入配置时 ÷1.25 落为逻辑值。
 
-        本环境屏幕（逻辑 864 高）容不下 850 物理高 + 标题栏，任何更矮请求
-        都会被 Tk 的 minsize 强制抬回 850——故高度落点确定为 850（÷1.25 = 680），
-        宽度 1500 正常生效（÷1.25 = 1200）。
+        用 1500x800（物理）作请求：宽 ≤ 屏幕、高 + 标题栏 ≤ 屏高，
+        不触发 WM 压窗/minsize 回弹，落点确定为 ÷1.25 = 1200x640。
         """
         s = make_settings(self.cfg)
         orig = App._compute_ui_scale
@@ -165,10 +165,10 @@ class WindowSizeTests(unittest.TestCase):
             app = App(s, LocalSource(s))
             try:
                 pump(app, 800)
-                app.geometry("1500x900")
+                app.geometry("1500x800")
                 pump(app, 1200)  # 防抖 500ms + 写盘
                 self.assertEqual(self.saved_config().get("window_size"),
-                                 "1200x680")
+                                 "1200x640")
             finally:
                 app.destroy()
         finally:
@@ -193,6 +193,63 @@ class WindowSizeTests(unittest.TestCase):
                 app.destroy()
         finally:
             App._compute_ui_scale = orig
+
+    # ---------------- 窗口位置记忆 / 界面缩放（#16/#20） ----------------
+
+    def test_window_pos_persisted_and_restored(self):
+        """位置记忆（#20）：保存 "+x+y"，新实例恢复到同位置。"""
+        s = make_settings(self.cfg)
+        app = App(s, LocalSource(s))
+        try:
+            pump(app, 800)
+            app.geometry("1150x780+120+90")
+            pump(app, 1200)  # 防抖 500ms + 写盘
+            self.assertEqual(self.saved_config().get("window_pos"), "+120+90")
+        finally:
+            app.destroy()
+
+        s2 = make_settings(self.cfg)
+        app2 = App(s2, LocalSource(s2))
+        try:
+            pump(app2, 500)
+            # 比较框架原点（geometry 的 +x+y），不能用 winfo_rootx——那是
+            # 客户区原点，相差边框+标题栏宽度（实测 +8,+31）
+            m = re.search(r"^\d+x\d+\+(\d+)\+(\d+)$", app2.geometry())
+            self.assertIsNotNone(m, app2.geometry())
+            self.assertEqual((int(m.group(1)), int(m.group(2))), (120, 90))
+        finally:
+            app2.destroy()
+
+    def test_window_pos_clamped_to_screen(self):
+        """位置越界（换小屏场景）→ 启动时收敛到屏内，窗口不会丢（#20）。
+
+        断言留 48px 容差：收敛值是 WM 框架原点，winfo_rootx/rooty 是客户区
+        原点，相差边框（~8px）+ 标题栏（~31px）。
+        """
+        s = make_settings(self.cfg, window_pos="+99999+99999")
+        app = App(s, LocalSource(s))
+        try:
+            pump(app, 500)
+            sw, sh = app.winfo_screenwidth(), app.winfo_screenheight()
+            self.assertLessEqual(app.winfo_rootx(), sw - 200 + 48)
+            self.assertLessEqual(app.winfo_rooty(), sh - 200 + 48)
+            self.assertGreaterEqual(app.winfo_rootx(), 0)
+            self.assertGreaterEqual(app.winfo_rooty(), 0)
+        finally:
+            app.destroy()
+
+    def test_ui_zoom_roundtrip_and_validate(self):
+        """界面缩放（#16）：随配置往返；越界值 validate 回退 1.0。"""
+        s = make_settings(self.cfg, ui_zoom=1.15)
+        s.save()
+        s2 = make_settings(self.cfg)
+        self.assertAlmostEqual(s2.ui_zoom, 1.15)
+        # 独立配置路径：上面的 save 已把 ui_zoom=1.15 写进 self.cfg，
+        # 复用同路径会被回填覆盖、测不到越界值
+        s3 = make_settings(os.path.join(self._tmp.name, "zoom_bad.json"),
+                           ui_zoom=9.9)
+        s3.validate()
+        self.assertEqual(s3.ui_zoom, 1.0)
 
 
 if __name__ == "__main__":

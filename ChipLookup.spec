@@ -36,6 +36,11 @@ a = Analysis(
         # 规则快照：src/fdnext/data/fdnext-core-3.2.0/*.json → _MEIPASS/fdnext/data/fdnext-core-3.2.0/
         (os.path.join(PROJECT_ROOT, 'src', 'fdnext', 'data'),
          'fdnext/data'),
+        # tools/ 整目录打包进 _MEIPASS/tools/，作为运行时兜底：
+        # src/fdnext/indexes.py 历史曾从 tools/sync_upstream import 常量，
+        # 迁移到 fdnext.upstream_common 后该 import 已消除，但保留打包避免
+        # 任何残留引用再次触发 "No module named 'sync_upstream'" 类运行时错误。
+        (os.path.join(PROJECT_ROOT, 'tools'), 'tools'),
     ],
     hiddenimports=[],
     hookspath=[],
@@ -74,5 +79,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    # icon=os.path.join(PROJECT_ROOT, 'assets', 'icon.ico') if os.path.exists(os.path.join(PROJECT_ROOT, 'assets', 'icon.ico')) else None,
+    # exe 自身图标：任务栏 / Alt-Tab 切换 / 资源管理器缩略图都用这个
+    # 路径：installer/chip_lookup.ico（7 档分辨率，256 / 128 / 64 / 48 / 32 / 24 / 16）
+    icon=os.path.join(PROJECT_ROOT, 'installer', 'chip_lookup.ico'),
 )

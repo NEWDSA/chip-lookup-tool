@@ -47,9 +47,19 @@ from src.database import ChipDatabase, default_database_path  # noqa: E402
 # 上游资源定义
 # ---------------------------------------------------------------------------
 
-UPSTREAM_BASE = (
+# 多源降级：国内可达镜像在前，GitHub raw 兜底最后。
+# 工厂/内网环境 raw.githubusercontent.com 常被墙或极慢，公共加速镜像可绕过；
+# 顺序即优先级，逐个尝试，全部失败才报错。
+UPSTREAM_BASES = (
+    "https://gh.llkk.cc/https://raw.githubusercontent.com/iTXTech/fdnext/"
+    "master/packages/core/resources/",
+    "https://ghproxy.net/https://raw.githubusercontent.com/iTXTech/fdnext/"
+    "master/packages/core/resources/",
+    "https://gcore.jsdelivr.net/gh/iTXTech/fdnext@master/packages/core/resources/",
+    "https://fastly.jsdelivr.net/gh/iTXTech/fdnext@master/packages/core/resources/",
+    "https://cdn.jsdelivr.net/gh/iTXTech/fdnext@master/packages/core/resources/",
     "https://raw.githubusercontent.com/iTXTech/fdnext/"
-    "master/packages/core/resources/"
+    "master/packages/core/resources/",
 )
 
 RESOURCES = {
@@ -112,17 +122,25 @@ def _is_fresh(path: str, max_age: float) -> bool:
 
 
 def _download(cache_dir: str, name: str, timeout: float) -> bytes:
-    """下载单个上游资源到缓存目录，返回字节内容。"""
-    url = UPSTREAM_BASE + name
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        data = resp.read()
-    os.makedirs(cache_dir, exist_ok=True)
-    tmp = _cache_path(cache_dir, name) + ".tmp"
-    with open(tmp, "wb") as f:
-        f.write(data)
-    os.replace(tmp, _cache_path(cache_dir, name))
-    return data
+    """按 UPSTREAM_BASES 顺序尝试下载，全部失败才抛错。返回字节内容。"""
+    last_exc: Exception | None = None
+    for base in UPSTREAM_BASES:
+        url = base + name
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = resp.read()
+            os.makedirs(cache_dir, exist_ok=True)
+            tmp = _cache_path(cache_dir, name) + ".tmp"
+            with open(tmp, "wb") as f:
+                f.write(data)
+            os.replace(tmp, _cache_path(cache_dir, name))
+            return data
+        except (urllib.error.URLError, OSError) as exc:
+            last_exc = exc
+    raise RuntimeError(
+        "下载 %s 失败（已尝试 %d 个源）: %s" % (name, len(UPSTREAM_BASES), last_exc)
+    ) from last_exc
 
 
 def fetch_json(

@@ -11,10 +11,15 @@
 - 双击 `setup.iss` → Inno Setup 编辑器打开 → 点击工具栏 **"编译" (F9)**
 
 **方法 B（命令行，适合 CI/CD）：**
+
 ```bash
 # Windows PowerShell
-& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" setup.iss
+& "D:\Program Files\Inno Setup 6\ISCC.exe" setup.iss
 ```
+
+> **路径说明：** Inno Setup 6 默认装到 `Program Files (x86)\Inno Setup 6\`，
+> 但本机实际安装在 `D:\Program Files\Inno Setup 6\`。以你机器上真实路径为准，
+> 用 PowerShell 查：`Get-Command ISCC.exe -ErrorAction SilentlyContinue`。
 
 ### 3. 产出
 生成的安装包位于：`../dist_installer/ChipLookup_Setup_1.0.0.exe`

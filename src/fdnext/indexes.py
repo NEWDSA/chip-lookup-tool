@@ -54,18 +54,26 @@ for _p in (ROOT, SRC):
 
 from src.database import ChipDatabase, default_database_path  # noqa: E402
 
-# 与 tools/sync_upstream.py 共用缓存与厂商显示名，避免两套约定漂移
-if os.path.join(ROOT, "tools") not in sys.path:
-    sys.path.insert(0, os.path.join(ROOT, "tools"))
-from sync_upstream import VENDOR_DISPLAY  # noqa: E402
-from sync_upstream import default_cache_dir  # noqa: E402
+# 与 tools/sync_upstream.py 共用厂商显示名和默认缓存目录，避免两套约定漂移。
+# 历史：曾通过把 ROOT/tools 加进 sys.path 后 from sync_upstream import ...，
+# 但 PyInstaller 打包时不扫 tools/，导致运行时 No module named 'sync_upstream'。
+# 现改为通过 fdnext 包内的 upstream_common 模块共享，PyInstaller 静态分析可见。
+from fdnext.upstream_common import VENDOR_DISPLAY  # noqa: E402
+from fdnext.upstream_common import default_cache_dir  # noqa: E402
 
-# GitHub raw 为主源；jsDelivr CDN 仅作降级镜像（国内网络更稳）。
-# 顺序即优先级：先 GitHub raw，失败再镜像。
+# 多源降级：国内可达镜像在前，GitHub raw 兜底最后。
+# 工厂/内网环境 raw.githubusercontent.com 常被墙或极慢，公共加速镜像可绕过；
+# 顺序即优先级，先试镜像，全部失败再试 GitHub raw。
 UPSTREAM_BASES = (
+    "https://gh.llkk.cc/https://raw.githubusercontent.com/iTXTech/fdnext/"
+    "master/packages/core/resources/",
+    "https://ghproxy.net/https://raw.githubusercontent.com/iTXTech/fdnext/"
+    "master/packages/core/resources/",
+    "https://gcore.jsdelivr.net/gh/iTXTech/fdnext@master/packages/core/resources/",
+    "https://fastly.jsdelivr.net/gh/iTXTech/fdnext@master/packages/core/resources/",
+    "https://cdn.jsdelivr.net/gh/iTXTech/fdnext@master/packages/core/resources/",
     "https://raw.githubusercontent.com/iTXTech/fdnext/"
     "master/packages/core/resources/",
-    "https://cdn.jsdelivr.net/gh/iTXTech/fdnext@master/packages/core/resources/",
 )
 
 # (文件名, 说明, 是否必需)

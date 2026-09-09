@@ -49,6 +49,9 @@ COLOR_WARN        = "#f59e0b"   # 警告黄
 COLOR_DANGER      = "#ef4444"   # 危险红
 COLOR_FOCUS       = "#38bdf8"   # 选中态（偏蓝，与 Accent Green 区分）
 
+# 应用版本（标题栏与「关于」对话框展示；对外可见的改版递增）
+APP_VERSION       = "1.1.0"
+
 
 # ---------------- Design Tokens ----------------
 # 字号层级
@@ -556,29 +559,37 @@ class App(tk.Tk):
     def __init__(self, settings: Settings, source: RecordSource,
                  on_change: Optional[Callable[[], None]] = None):
         super().__init__()
+        # settings 提前赋值：缩放因子需要读 ui_zoom 偏好（#16）
+        self.settings = settings
         # DPI 缩放因子（必须先于任何像素尺寸计算）：winfo_fpixels('1i') 返回
         # 当前显示器真实 DPI（进程开启 DPI 感知后，125% 缩放 → 120），除以 96
-        # 得缩放系数。像素类常量（窗口尺寸/行高/列宽等）经 _s() 缩放，保证高分
+        # 得缩放系数，再乘用户界面缩放偏好（⋯菜单可选 0.8~1.6，#16）。
+        # 像素类常量（窗口尺寸/行高/列宽等）经 _s() 缩放，保证高分
         # 屏下布局比例与 96 DPI 一致（字体是 pt 单位，Tk 按 scaling 自动缩放）。
-        self._ui_scale = self._compute_ui_scale()
-        self.title("ChipLookup · 芯片料号查询器")
-        self.minsize(self._s(1000), self._s(680))
+        self._ui_scale = self._compute_ui_scale() * self._zoom_factor()
+        self.title(f"ChipLookup v{APP_VERSION} · 芯片料号查询器")
+        # #5：minsize 1000x680 → 720x560 —— 1080p@125% 半屏（逻辑 768 宽）可贴靠，
+        # 「左资料右查询」的分屏工作流可用；窄窗可用性由状态栏三态折叠（#5）+
+        # 底栏低频项收纳（#9）保证
+        self.minsize(self._s(720), self._s(560))
         self.configure(bg=COLOR_BG)
 
         # 窗口尺寸记忆状态（见 _on_window_configure / _save_window_size）
         self._win_size_ready: bool = False         # 启动就绪前忽略尺寸事件（程序性变化）
         self._win_size_save_after: Optional[str] = None  # 尺寸防抖保存句柄
         self._last_saved_win_size: Optional[Tuple[int, int]] = None  # 上次已保存尺寸（去重）
+        self._last_saved_win_pos: Optional[str] = None  # 上次已保存位置（去重，#20）
         # 左栏右缘 grid padx（逻辑 7px）：_apply_pane_width 计算列 minsize 时需一并计入，
         # 实例属性按 DPI 缩放（类常量保留逻辑值便于追溯）
         self._LEFT_PADX = self._s(self._LEFT_PADX)
-        # 状态栏 toast / 紧凑文案状态（见 _toast / _refresh_status）
+        # 状态栏 toast / 三态文案状态（见 _toast / _refresh_status / _status_mode）
         self._toast_after: Optional[str] = None   # toast 到期恢复回调句柄（连续 toast 防抖）
-        self._status_compact: bool = False        # 状态栏当前是否为窄窗紧凑文案
+        self._status_mode_state: str = "full"     # 状态栏当前文案态 full/compact/hidden（#5/#8）
 
-        self.settings = settings
-        # 初始尺寸：优先恢复用户上次手动调整并保存的大小，否则用默认尺寸
-        self.geometry("%dx%d" % self._initial_window_size())
+        # 初始尺寸/位置：优先恢复用户上次手动调整并保存的大小与位置（#20），
+        # 位置按屏幕边界收敛防止丢失；从未保存过则用默认尺寸
+        w, h = self._initial_window_size()
+        self.geometry("%dx%d%s" % (w, h, self._saved_window_pos_suffix()))
         self.source = source
         self.on_change = on_change
         self._records_cache = self.source.list_records()
@@ -609,7 +620,8 @@ class App(tk.Tk):
 
         # ---------- 候选区分页参数 ----------
         self.PAGE_SIZE = 8                # 每页条数，与 tree 可见行数一致
-        self.page_mode = tk.StringVar(value="paginate")  # "paginate" | "load_more"
+        # #10：固定「加载更多」模式（策略选择行已移除）；"paginate" 渲染路径保留
+        self.page_mode = tk.StringVar(value="load_more")  # "paginate" | "load_more"
         self._current_page: int = 0        # 分页模式：当前页（0-indexed）
         self._visible_count: int = self.PAGE_SIZE  # 加载更多模式：已加载条数
         self._tree_col_cache: Optional[Tuple[int, ...]] = None  # 树列宽缓存（防抖动）
@@ -630,6 +642,7 @@ class App(tk.Tk):
         self._tree_tip: Optional[tk.Toplevel] = None      # 行信息气泡（完整料号/厂商/容量）
         self._tree_tip_after: Optional[str] = None        # 行级提示 600ms 防抖句柄
         self._tree_tip_row: Optional[str] = None          # 气泡当前对应的行 iid（换行即重置）
+        self._tree_hover_row: Optional[str] = None        # hover 高亮当前所在行（#13）
 
         self._configure_style()
         self._build_layout()
@@ -699,7 +712,9 @@ class App(tk.Tk):
             borderwidth=1,
             relief="flat",
             padding=(10, 8),
-            font=("Consolas", 12),
+            # #19：Consolas 只对纯 ASCII 有意义，输入框常混中文/全角 → 用 UI 字体；
+            # 料号展示区（详情 Big label）保持 Consolas 等宽对齐
+            font=("Microsoft YaHei UI", 12),
         )
         # 输入框聚焦态（#4 焦点可见）：边框/内亮线变亮蓝，与按钮焦点环同色系
         style.map(
@@ -963,20 +978,9 @@ class App(tk.Tk):
         ttk.Label(left, text="候选（↑↓ 选择，Enter 查看详情）",
                   style="Hint.TLabel").pack(anchor="w", pady=(0, 6))
 
-        # 分页模式分段按钮（紧凑）：[分页] [加载更多]
-        mode_row = ttk.Frame(left, style="Panel.TFrame")
-        mode_row.pack(fill=tk.X, pady=(0, 8))
-        ttk.Label(mode_row, text="分页：", style="Hint.TLabel").pack(side=tk.LEFT, padx=(0, 6))
-        self.btn_mode_paginate = ttk.Button(
-            mode_row, text="分页", style="ModeSel.TButton",
-            command=lambda: self._set_mode("paginate"),
-        )
-        self.btn_mode_paginate.pack(side=tk.LEFT, padx=(0, 2))
-        self.btn_mode_load_more = ttk.Button(
-            mode_row, text="加载更多", style="ModeSel.TButton",
-            command=lambda: self._set_mode("load_more"),
-        )
-        self.btn_mode_load_more.pack(side=tk.LEFT)
+        # #10：分页策略选择行已移除——暴露「分页/加载更多」是实现概念不是用户
+        # 目标，且占一行纵向空间。固定用「加载更多」（悬停/键盘到末行自动追加，
+        # pager 行内按钮兜底）；分页渲染代码路径保留（将来可配置化再启用）。
 
         # 候选 Treeview 与分页控件的容器（让 tree 区域可扩展、pager 始终贴底）
         tree_box = ttk.Frame(left, style="Panel.TFrame")
@@ -1057,6 +1061,8 @@ class App(tk.Tk):
             ("type", 80, "center"),
         ]:
             self.tree.column(c, width=w, anchor=anchor)
+        # #13 行 hover 高亮：hover tag 底色（选中行样式优先级更高，不受影响）
+        self.tree.tag_configure("hover", background=COLOR_CARD_HOVER)
         # tree 占大头（fill both + expand），但放进 tree_box 后由 box 控制边界
         # side=TOP + expand=True：吃占 pager 留下的剩余空间
         self.tree.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
@@ -1075,6 +1081,9 @@ class App(tk.Tk):
         self.tree.bind("<Motion>", self._on_tree_tip_motion, add="+")
         self.tree.bind("<Leave>", self._on_tree_tip_leave, add="+")
         self.tree.bind("<MouseWheel>", lambda e: self._tree_tip_hide(), add="+")
+        # 行 hover 高亮（#13）：与光标切换/行提示并行不悖（add 叠加绑定）
+        self.tree.bind("<Motion>", self._on_tree_hover_motion, add="+")
+        self.tree.bind("<Leave>", self._on_tree_hover_leave, add="+")
 
         # 左右分栏分隔条：按住拖动调整左栏宽度，右栏随之动态适配。
         # #6 扩大点击目标：画布命中区 12px（原 6px 视觉条即命中区，太窄难点中），
@@ -1115,7 +1124,9 @@ class App(tk.Tk):
         # 默认空状态
         self._render_detail_empty()
 
-        # 底部操作栏（#7：tooltip 带上快捷键提示，能点也知道怎么快）
+        # 底部操作栏（#9 重组）：视觉权重与使用频率成正比——高频的复制/清空
+        # 保留实体按钮，低频的导入/导出/刷新与设置项收进「更多 ⋯」菜单，
+        # 退出独占最右（与功能按钮拉开，降低误触）
         bottom = ttk.Frame(self, style="Panel.TFrame", padding=(14, 8))
         bottom.pack(fill=tk.X, side=tk.BOTTOM)
         b = ttk.Button(bottom, text="复制全部", style="Accent.TButton",
@@ -1130,20 +1141,36 @@ class App(tk.Tk):
                        command=self._clear_query)
         b.pack(side=tk.LEFT, padx=(0, 6))
         ToolTip(b, "清空查询输入 (Esc)")
-        ttk.Separator(bottom, orient="vertical").pack(side=tk.LEFT, fill=tk.Y, padx=(0, 6))
-        b = ttk.Button(bottom, text="导入 CSV", style="Ghost.TButton",
-                       command=self._import_csv)
-        b.pack(side=tk.LEFT, padx=(0, 6))
-        ToolTip(b, "导入 CSV 合并到现有数据库")
-        b = ttk.Button(bottom, text="导出 CSV", style="Ghost.TButton",
-                       command=self._export_csv)
-        b.pack(side=tk.LEFT, padx=(0, 6))
-        ToolTip(b, "导出当前数据库为 CSV")
-        b = ttk.Button(bottom, text="刷新数据", style="Ghost.TButton",
-                       command=self._reload_db)
-        b.pack(side=tk.LEFT, padx=(0, 6))
-        ToolTip(b, "弃用缓存，强制重建当前数据源 (F5)")
-        ttk.Separator(bottom, orient="vertical").pack(side=tk.LEFT, fill=tk.Y, padx=(0, 6))
+
+        more_btn = ttk.Menubutton(bottom, text="更多 ⋯", style="Ghost.TButton")
+        more_btn.pack(side=tk.LEFT, padx=(0, 6))
+        ToolTip(more_btn, "导入/导出 CSV、刷新数据、界面缩放、关于")
+        # 深色菜单（与主题一致；tearoff=0 去掉 Win 的可撕离虚线）
+        more_menu = tk.Menu(
+            more_btn, tearoff=0, bg=COLOR_CARD, fg=COLOR_TEXT,
+            activebackground=COLOR_CARD_HOVER, activeforeground=COLOR_TEXT, bd=1,
+        )
+        more_menu.add_command(label="导入 CSV…", command=self._import_csv)
+        more_menu.add_command(label="导出 CSV…", command=self._export_csv)
+        more_menu.add_separator()
+        more_menu.add_command(label="刷新数据", accelerator="F5", command=self._reload_db)
+        more_menu.add_separator()
+        # 界面缩放（#16）：radio 组写入配置，布局常量启动时已实例化 → 重启生效
+        zoom_menu = tk.Menu(
+            more_menu, tearoff=0, bg=COLOR_CARD, fg=COLOR_TEXT,
+            activebackground=COLOR_CARD_HOVER, activeforeground=COLOR_TEXT,
+        )
+        self._zoom_var = tk.IntVar(value=int(round(self.settings.ui_zoom * 100)))
+        for pct in (85, 100, 115, 130):
+            zoom_menu.add_radiobutton(
+                label=f"{pct}%", variable=self._zoom_var, value=pct,
+                command=lambda p=pct: self._set_ui_zoom(p / 100.0),
+            )
+        more_menu.add_cascade(label="界面缩放（重启生效）", menu=zoom_menu)
+        more_menu.add_separator()
+        more_menu.add_command(label="关于 ChipLookup", command=self._show_about)
+        more_btn.configure(menu=more_menu)
+
         b = ttk.Button(bottom, text="退出", style="Ghost.TButton",
                        command=self.destroy)
         b.pack(side=tk.RIGHT)
@@ -1276,17 +1303,20 @@ class App(tk.Tk):
         self.bind("<F5>", lambda e: self._reload_db())
 
     def _refresh_status(self):
-        """状态栏主文案。
+        """状态栏主文案三态（#5 响应式 + #8 去重）：
 
-        UI 评审 #8 去重：原文案「模式 X · LABEL · 文件名 • 共 N 条记录」里
-        模式名与 describe() 的 LABEL 重复、文件名又与切换完成 toast 撞文案
-        → 常驻只留「模式 · 条数」，完整描述移入悬停 tooltip（动态更新）；
-        窄窗口只留条数（模式看顶栏 radio 选中态）。
+        full（≥ 逻辑 1150px）「模式 · 共 N 条」
+        compact（< 1150）    「共 N 条」（模式看顶栏 radio 选中态）
+        hidden（< 900）      清空文字（极窄窗给 radio 组让位；悬停 tooltip 仍在）
+
+        去重：describe()（LABEL · 文件名）只进悬停 tooltip，不常驻。
         """
         mode_label = MODE_LABELS.get(self.settings.mode, self.settings.mode)
         count = self.source.count()
-        self._status_compact = self._status_is_compact()
-        if self._status_compact:
+        self._status_mode_state = self._status_mode()
+        if self._status_mode_state == "hidden":
+            self.status_label.configure(text="")
+        elif self._status_mode_state == "compact":
             self.status_label.configure(text=f"共 {count} 条")
         else:
             self.status_label.configure(text=f"{mode_label} · 共 {count} 条")
@@ -1294,21 +1324,24 @@ class App(tk.Tk):
         if tip is not None:
             tip.update_text(self.source.describe())
 
-    def _status_is_compact(self) -> bool:
-        """窗口宽是否低于状态栏完整文案阈值（逻辑 1150px）。
+    def _status_mode(self) -> str:
+        """按窗口物理宽判定状态栏文案态（阈值逻辑 px，经 _s 缩放比较）。
 
-        阈值依据：标题 + 完整文案 + radio 组 + 极简按钮可同排共存的最小宽，
-        低于它完整文案会挤压右侧 radio 区域。窗口尚未量出尺寸
-        （winfo_width ≤ 1，__init__ 首调时还没布局）按非紧凑处理，避免
-        启动首帧误入紧凑态。
+        full ≥ 1150 > compact ≥ 900 > hidden。窗口尚未量出尺寸
+        （winfo_width ≤ 1，__init__ 首调时还没布局）按 full 处理，
+        避免启动首帧误判；布局就绪后 _enable_win_size_tracking 会重刷。
         """
         try:
             w = self.winfo_width()
         except Exception:
-            return False
+            return "full"
         if w <= 1:
-            return False
-        return w < self._s(1150)
+            return "full"
+        if w < self._s(900):
+            return "hidden"
+        if w < self._s(1150):
+            return "compact"
+        return "full"
 
     def _refresh_source_buttons(self):
         """把 radio 组件选中项同步到当前模式（互斥由共享变量自动保证）。"""
@@ -1491,13 +1524,13 @@ class App(tk.Tk):
         # 失败收尾：radio 恢复可用（#12），让用户重试或改选其他模式
         self._set_radios_enabled(True)
         if self._desired_mode is None:
-            # 没有更新的目标 → 回滚到当前已加载模式并提示
+            # 没有更新的目标 → 回滚到当前已加载模式
             self._refresh_source_buttons()
             self._refresh_status()
-            messagebox.showerror(
-                "切换模式失败",
-                f"无法载入「{MODE_LABELS.get(mode, mode)}」数据源：\n{exc}",
-            )
+            # #14：切换失败改非阻断 toast（原模态框打断浏览流；错误红字停留
+            # 3.8s，radio 已回滚到可用模式，用户可直接重试或改选）
+            self._toast(
+                f"切换「{MODE_LABELS.get(mode, mode)}」失败：{exc}", error=True)
         # 已有更新的目标（用户忙中又点了别的模式）→ 不打断，直接跑下一个
         self._pump_switch()
 
@@ -1586,6 +1619,8 @@ class App(tk.Tk):
         self.tree.selection_set(children[idx])
         self.tree.focus(children[idx])
         self.tree.see(children[idx])
+        # #10：键盘浏览到已加载末行 → 自动追加更多（加载更多模式，焦点不跳）
+        self._maybe_autoload_more(children[idx])
 
     def _on_candidate_select(self, event=None):
         sel = self.tree.selection()
@@ -1947,6 +1982,9 @@ class App(tk.Tk):
             row = self.tree.identify_row(event.y)
         except tk.TclError:
             return
+        if row:
+            # #10：悬停到已加载末行且还有剩余 → 自动追加（加载更多模式）
+            self._maybe_autoload_more(row)
         if row != self._tree_tip_row:
             self._tree_tip_hide()
             self._tree_tip_row = row
@@ -1989,6 +2027,45 @@ class App(tk.Tk):
             return
         self._tree_tip = _create_tip_window(self, text)
         _place_tip_window(self._tree_tip)
+
+    # ---------------- 行 hover 高亮（#13） ----------------
+
+    def _on_tree_hover_motion(self, event):
+        """指针所在行加 hover 底色（tag 移动方案，零自绘）。
+
+        选中行的 selected 样式优先级高于 tag 背景，选中高亮不受影响；
+        重渲染后行iid不变但 tags 被清空，指针再动一格即恢复。
+        """
+        try:
+            row = self.tree.identify_row(event.y)
+        except tk.TclError:
+            return
+        if row == self._tree_hover_row:
+            return
+        old = self._tree_hover_row
+        self._tree_hover_row = row
+        if old is not None:
+            try:
+                if self.tree.exists(old):
+                    self.tree.item(old, tags=())
+            except tk.TclError:
+                pass
+        if row:
+            try:
+                self.tree.item(row, tags=("hover",))
+            except tk.TclError:
+                pass
+
+    def _on_tree_hover_leave(self, _event=None):
+        """指针离开候选列表：撤掉 hover 高亮。"""
+        old = self._tree_hover_row
+        self._tree_hover_row = None
+        if old is not None:
+            try:
+                if self.tree.exists(old):
+                    self.tree.item(old, tags=())
+            except tk.TclError:
+                pass
 
     def _on_tree_press(self, event):
         """左键落在自绘表头分隔线附近时接管拖动：本列变宽、右侧各列让位（总宽恒定）。
@@ -2221,11 +2298,12 @@ class App(tk.Tk):
     DEFAULT_WINDOW_SIZE = (1040, 720)  # 默认窗口尺寸（从未手动调整过时使用）
 
     def _enable_win_size_tracking(self):
-        """启动布局稳定后开启尺寸跟踪；当前尺寸视为基准（不触发保存）。"""
+        """启动布局稳定后开启尺寸跟踪；当前尺寸/位置视为基准（不触发保存）。"""
         self._win_size_ready = True
         self._last_saved_win_size = (self.winfo_width(), self.winfo_height())
-        # 布局已稳定 → 按真实窗口宽重算一次状态栏完整/紧凑文案（#8：
-        # __init__ 里的首刷发生在布局前，紧凑态判定还没法基于真实宽度）
+        self._last_saved_win_pos = "+%d+%d" % (self.winfo_rootx(), self.winfo_rooty())
+        # 布局已稳定 → 按真实窗口宽重算一次状态栏三态文案（#5/#8：
+        # __init__ 里的首刷发生在布局前，文案态判定还没法基于真实宽度）
         self._refresh_status()
 
     def _initial_window_size(self) -> Tuple[int, int]:
@@ -2256,6 +2334,61 @@ class App(tk.Tk):
         h = max(min_h, min(h, screen_h - self._s(60)))
         return w, h
 
+    def _saved_window_pos_suffix(self) -> str:
+        """恢复上次关闭时的窗口位置（"+x+y"，#20），按屏幕边界收敛防丢失。
+
+        收敛规则：x/y 不超过「屏幕尺寸 - 200px」——标题栏至少 200px 露在
+        屏内，换小屏/拔掉显示器后窗口仍可被拖回（评审 #20 的防丢诉求）。
+        从未记录或解析失败 → 返回空串（用系统默认位置）。
+        """
+        pos = getattr(self.settings, "window_pos", None)
+        if not pos:
+            return ""
+        try:
+            xs, ys = str(pos).lstrip("+").split("+", 1)
+            x, y = int(xs), int(ys)
+        except (ValueError, AttributeError):
+            return ""
+        try:
+            sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        except Exception:
+            return ""
+        x = max(0, min(x, sw - 200))
+        y = max(0, min(y, sh - 200))
+        return "+%d+%d" % (x, y)
+
+    def _zoom_factor(self) -> float:
+        """用户界面缩放偏好（#16）：乘在 DPI 因子上，0.8~1.6，异常回 1.0。"""
+        try:
+            z = float(getattr(self.settings, "ui_zoom", 1.0))
+        except (TypeError, ValueError):
+            return 1.0
+        return z if 0.8 <= z <= 1.6 else 1.0
+
+    def _set_ui_zoom(self, zoom: float):
+        """保存界面缩放偏好（⋯菜单，#16）。
+
+        布局常量（列宽/行高/分栏/窗口尺寸）在启动时已按当时因子实例化，
+        热更需整体重建 → 写入配置后提示重启生效。
+        """
+        self.settings.ui_zoom = zoom
+        try:
+            self.settings.save()
+        except Exception:
+            pass  # 写失败不影响运行，重启后仍会回退默认
+        self._toast(f"界面缩放已设为 {int(round(zoom * 100))}%，重启后生效")
+
+    def _show_about(self):
+        """关于对话框（#18）：版本与当前数据源概况。"""
+        messagebox.showinfo(
+            "关于 ChipLookup",
+            f"ChipLookup v{APP_VERSION}\n"
+            "芯片料号查询器（本地 CSV / 网络数据源 / 混合检索）\n\n"
+            f"当前模式：{MODE_LABELS.get(self.settings.mode, self.settings.mode)}"
+            f" · 共 {self.source.count()} 条记录\n"
+            f"数据源：{self.source.describe()}",
+        )
+
     def _on_window_configure(self, event):
         """顶层尺寸变化 → 防抖 500ms 后持久化（只记用户手动调整）。
 
@@ -2265,8 +2398,8 @@ class App(tk.Tk):
         """
         if event.widget is not self or not self._win_size_ready:
             return
-        # 跨越窄窗阈值 → 状态栏在完整/紧凑文案间切换（#8；只在状态翻转时重绘）
-        if self._status_is_compact() != self._status_compact:
+        # 跨越状态栏文案阈值 → full/compact/hidden 三态切换（#5；翻转时才重绘）
+        if self._status_mode() != self._status_mode_state:
             self._refresh_status()
         if self._win_size_save_after is not None:
             try:
@@ -2276,12 +2409,17 @@ class App(tk.Tk):
         self._win_size_save_after = self.after(500, self._save_window_size)
 
     def _save_window_size(self):
-        """防抖落地：当前窗口尺寸写入 chiplookup.json。
+        """防抖落地：当前窗口尺寸与位置写入 chiplookup.json。
 
         最大化(zoomed)时不记录——保留最近一次正常尺寸，还原窗口不丢；
-        与上次已保存尺寸相同则跳过（去重，避免无谓写盘）。
+        尺寸与位置都与上次已保存值相同则跳过（去重，避免无谓写盘；
+        位置单独变化——只拖不动窗——也要记录，故两者分别比较）。
         写入的是「逻辑像素」（物理尺寸 ÷ DPI 因子）：配置跨缩放比例稳定，
         96 DPI 环境下因子为 1.0，与旧格式完全兼容。
+
+        位置取自 geometry()（WM 框架原点），与 _saved_window_pos_suffix 的
+        geometry("+x+y") 恢复端同基准——用 winfo_rootx（客户区原点）会带入
+        标题栏/边框偏移，存取一次位置就漂移（实测 +120+90 → +128+121）。
         """
         self._win_size_save_after = None
         try:
@@ -2290,12 +2428,24 @@ class App(tk.Tk):
             w, h = self.winfo_width(), self.winfo_height()
         except Exception:
             return
-        if (w, h) == self._last_saved_win_size or w < 300 or h < 300:
+        if w < 300 or h < 300:
+            return
+        m = _re.search(r"^\d+x\d+([+-]\d+)([+-]\d+)", self.geometry())
+        if m and int(m.group(1)) >= 0 and int(m.group(2)) >= 0:
+            pos = "+%d+%d" % (int(m.group(1)), int(m.group(2)))
+        else:
+            # 解析失败或负坐标（副屏在主屏左侧）：不更新位置记忆
+            pos = self._last_saved_win_pos
+        if ((w, h) == self._last_saved_win_size
+                and pos == self._last_saved_win_pos):
             return
         self._last_saved_win_size = (w, h)
+        self._last_saved_win_pos = pos
         scale = self._ui_scale if self._ui_scale else 1.0
         self.settings.window_size = "%dx%d" % (
             int(round(w / scale)), int(round(h / scale)))
+        if pos is not None:
+            self.settings.window_pos = pos
         try:
             self.settings.save()
         except Exception:
@@ -2457,13 +2607,12 @@ class App(tk.Tk):
             self.tree.focus(children[0])
 
     def _refresh_mode_buttons(self):
-        is_paginate = self.page_mode.get() == "paginate"
-        self.btn_mode_paginate.configure(
-            style="ModeSelActive.TButton" if is_paginate else "ModeSel.TButton"
-        )
-        self.btn_mode_load_more.configure(
-            style="ModeSelActive.TButton" if not is_paginate else "ModeSel.TButton"
-        )
+        """分页策略分段按钮已随 #10 移除（固定「加载更多」模式）。
+
+        保留空实现兼容既有调用点（__init__ / _render_candidates）；
+        分页渲染路径将来若配置化复用，再恢复按钮创建与高亮逻辑。
+        """
+        return
 
     def _set_mode(self, mode: str):
         if self.page_mode.get() == mode:
@@ -2490,7 +2639,7 @@ class App(tk.Tk):
             self._current_page += 1
             self._render_candidates()
 
-    def _load_more(self):
+    def _load_more(self, keep_focus: bool = False):
         new_count = min(self._visible_count + self.PAGE_SIZE, len(self._candidates))
         old_count = self._visible_count
         self._visible_count = new_count
@@ -2498,7 +2647,23 @@ class App(tk.Tk):
         if new_count > old_count:
             self._insert_rows(old_count, new_count)
         self._refresh_pager()
+        if keep_focus:
+            # 自动追加（#10）时不回选首行——用户正在浏览，焦点跳回开头会打断
+            return
         self._select_first()
+
+    def _maybe_autoload_more(self, row: str):
+        """加载更多模式的自动追加（#10）：指针/焦点到达已加载末行且还有剩余。"""
+        if self.page_mode.get() != "load_more":
+            return
+        if self._visible_count >= len(self._candidates):
+            return
+        try:
+            rows = self.tree.get_children()
+        except tk.TclError:
+            return
+        if rows and row == rows[-1]:
+            self._load_more(keep_focus=True)
 
     def _run_query(self):
         q = self.var_query.get().strip()
@@ -2559,6 +2724,23 @@ class App(tk.Tk):
                   font=("Microsoft YaHei UI", 12)).pack(pady=(40, 4))
         ttk.Label(f, text="提示：支持料号、型号、厂商、容量；空格不区分大小写。", style="TLabel",
                   font=("Microsoft YaHei UI", 9), foreground=COLOR_TEXT_DIM).pack()
+        # 空状态给「可点的第一步」（#15）：放几个库里现成的示例料号，
+        # 点击填入查询框（var_query trace 自动触发防抖查询），零学习成本
+        samples = []
+        for rec in self._records_cache[:3]:
+            pn = (rec.get("part_number", "") or "").strip()
+            if pn:
+                samples.append(pn)
+        if samples:
+            row = ttk.Frame(f, style="TFrame")
+            row.pack(pady=(16, 0))
+            ttk.Label(row, text="试试：", style="TLabel",
+                      foreground=COLOR_TEXT_DIM).pack(side=tk.LEFT, padx=(0, 6))
+            for pn in samples:
+                btn = ttk.Button(row, text=pn, style="ModeSel.TButton",
+                                 command=lambda p=pn: self._fill_query(p))
+                btn.pack(side=tk.LEFT, padx=(0, 6))
+                ToolTip(btn, "点击填入查询框并搜索")
 
     def _render_detail_not_found(self, query: str, suggests: List[str]):
         self._clear_detail()
@@ -2622,29 +2804,31 @@ class App(tk.Tk):
         if tag_text:
             ttk.Label(head, text=tag_text, style="Dim.TLabel").pack(anchor="w", pady=(6, 0))
 
-        # 分组卡片
+        # 分组卡片（#17：字段标签主中文，英文全称悬停可见——双语并排每行
+        # 占 ~80px 宽度且对中文用户是噪音，字段值获得更多显示空间）
         groups = [
             ("基本", [
-                ("厂商 Manufacturer", record.get("manufacturer", "")),
-                ("类型 Type", record.get("type", "")),
-                ("型号 Model", record.get("model", "")),
+                ("厂商", "Manufacturer", record.get("manufacturer", "")),
+                ("类型", "Type", record.get("type", "")),
+                ("型号", "Model", record.get("model", "")),
             ]),
             ("存储参数", [
-                ("容量 Capacity", _capacity_display(record.get("capacity", ""), record.get("bit_width", ""))),
-                ("位宽 Bit Width", record.get("bit_width", "")),
-                ("速度 Speed", record.get("speed", "")),
-                ("电压 Voltage", record.get("voltage", "")),
+                ("容量", "Capacity",
+                 _capacity_display(record.get("capacity", ""), record.get("bit_width", ""))),
+                ("位宽", "Bit Width", record.get("bit_width", "")),
+                ("速度", "Speed", record.get("speed", "")),
+                ("电压", "Voltage", record.get("voltage", "")),
             ]),
             ("物理信息", [
-                ("封装 Package", record.get("package", "")),
-                ("尺寸 Dimensions", record.get("dimensions", "")),
-                ("Die 数 Die Count", record.get("die_count", "")),
-                ("CS 数 CS Count", record.get("cs_count", "")),
-                ("Die 版本 Die Rev", record.get("die_revision", "")),
+                ("封装", "Package", record.get("package", "")),
+                ("尺寸", "Dimensions", record.get("dimensions", "")),
+                ("Die 数", "Die Count", record.get("die_count", "")),
+                ("CS 数", "CS Count", record.get("cs_count", "")),
+                ("Die 版本", "Die Revision", record.get("die_revision", "")),
             ]),
             ("使用条件", [
-                ("工作温度 Op Temp", record.get("op_temp", "")),
-                ("备注 Notes", record.get("notes", "")),
+                ("工作温度", "Op Temp", record.get("op_temp", "")),
+                ("备注", "Notes", record.get("notes", "")),
             ]),
         ]
         for title, rows in groups:
@@ -2653,13 +2837,14 @@ class App(tk.Tk):
             ttk.Label(card, text=title,
                       style="Card.TLabel",
                       font=("Microsoft YaHei UI", 11, "bold")).pack(anchor="w", pady=(0, 10))
-            for label, value in rows:
+            for label, en, value in rows:
                 display = str(value) if value not in ("", None) else "\u2014"  # 空值显示占位符「—」
                 is_empty = value in ("", None)
                 row = ttk.Frame(card, style="Card.TFrame")
                 row.pack(fill=tk.X, pady=2)
-                lab = ttk.Label(row, text=label, style="Field.TLabel", width=22, anchor="w")
+                lab = ttk.Label(row, text=label, style="Field.TLabel", width=10, anchor="w")
                 lab.pack(side=tk.LEFT)
+                ToolTip(lab, en)  # 英文全称悬停可见（#17）
                 val = ttk.Label(
                     row, text=display,
                     style="DimValue.TLabel" if is_empty else "Value.TLabel",
@@ -2712,25 +2897,30 @@ class App(tk.Tk):
         # Tk 在某些平台需要 update 才能落到剪贴板
         self.update()
 
-    def _toast(self, msg: str):
-        """状态栏 toast：✓ 文案停留 1.8s 后恢复常规状态。
+    def _toast(self, msg: str, error: bool = False):
+        """状态栏 toast：✓/✗ 文案停留后恢复常规状态。
 
         恢复不走弹出时的文本快照——旧实现会把 toast 期间发生的正常状态
         更新覆盖回旧值，且连续 toast 各自排期、相互闪断。改为到期直接调
         _refresh_status() 重算当前真实状态；连续 toast 只保留最后一个到期
-        回调（防抖）。同时承担极简模式的操作反馈（#11）。
+        回调（防抖）。同时承担极简模式的操作反馈（#11）与非阻断错误提示
+        （#14：error=True 红字、停留 3.8s，替代数据源切换失败的模态框）。
         """
         if self._toast_after is not None:
             try:
                 self.after_cancel(self._toast_after)
             except Exception:
                 pass
-        self.status_label.configure(text=f"✓ {msg}")
-        self._toast_after = self.after(1800, self._toast_reset)
+        self.status_label.configure(
+            text=f"{'✗' if error else '✓'} {msg}",
+            foreground=COLOR_DANGER if error else COLOR_TEXT_DIM,
+        )
+        self._toast_after = self.after(3800 if error else 1800, self._toast_reset)
 
     def _toast_reset(self):
-        """toast 到期：按当前真实状态重算状态栏文案（模式/条数/紧凑态）。"""
+        """toast 到期：恢复常规前景色并按当前真实状态重算文案。"""
         self._toast_after = None
+        self.status_label.configure(foreground=COLOR_TEXT_DIM)
         self._refresh_status()
 
     # ---------------- 数据导入导出 ----------------

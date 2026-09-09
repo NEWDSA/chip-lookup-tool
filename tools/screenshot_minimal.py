@@ -69,7 +69,7 @@ def main():
 
     app._set_minimal_mode(False, animate=False)
     pump(app, 300)
-    app.geometry("1000x680")  # 最小允许尺寸
+    app.geometry("720x560")  # 最小允许尺寸（#5 降档后）
     pump(app, 400)
     grab(app, os.path.join(out_dir, "ui_review_minsize.png"))
 
