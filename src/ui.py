@@ -117,6 +117,10 @@ def make_text_for_copy(record: dict) -> str:
         v = (record.get(k, "") or "").strip()
         if v:
             lines.append(f"{label}: {v}")
+    # 添加 GB 值
+    cap_gb = _capacity_gb(record.get("capacity", ""))
+    if cap_gb:
+        lines.append(f"GB值: {cap_gb}")
     return "\n".join(lines)
 
 
@@ -127,13 +131,12 @@ _BITWIDTH_RE = _re.compile(r"[xX]?(\d+)")
 
 
 def _capacity_display(capacity: str, bit_width: str) -> str:
-    """把原始容量换算为带 GB 的显示文本。
+    """把原始容量换算为 Config 格式显示文本。
 
-    公式：单颗粒容量(GB) = 标称容量(Gb) ÷ 8
-    例：16Gb → 2 GB；24Gb → 3 GB；4Gb → 0.5 GB
+    公式：Config 深度 = Capacity / BitWidth
+    例：16Gb + x4 → 4G x4 (16Gb)；8Gb + x8 → 1G x8 (8Gb)
 
-    说明：DRAM 标称容量已包含总存储位数，bit_width 表示数据总线宽度，
-    不参与容量换算。
+    说明：DRAM 标称容量已包含总存储位数，bit_width 表示数据总线宽度。
     """
     if not capacity:
         return capacity
@@ -144,11 +147,41 @@ def _capacity_display(capacity: str, bit_width: str) -> str:
         density_g = float(cm.group(1))
     except (ValueError, IndexError):
         return capacity
+    # 提取 bit_width 数值
+    bw = 0
+    if bit_width:
+        bw_m = _BITWIDTH_RE.search(bit_width)
+        if bw_m:
+            try:
+                bw = int(bw_m.group(1))
+            except (ValueError, IndexError):
+                pass
+    # 计算 Config 深度
+    if bw > 0:
+        config_depth = density_g / bw
+        config_str = ("%g" % config_depth) if config_depth != int(config_depth) else str(int(config_depth))
+        return "%sG %s (%s)" % (config_str, bit_width, capacity)
+    return capacity
+
+
+def _capacity_gb(capacity: str) -> str:
+    """把原始容量换算为 GB 值显示文本。
+
+    公式：GB = 标称容量(Gb) ÷ 8
+    例：16Gb → 2GB；24Gb → 3GB；4Gb → 0.5GB
+    """
+    if not capacity:
+        return ""
+    cm = _CAPACITY_RE.search(capacity)
+    if not cm:
+        return ""
+    try:
+        density_g = float(cm.group(1))
+    except (ValueError, IndexError):
+        return ""
     gb = density_g / 8
     gb_str = ("%g" % gb) if gb != int(gb) else str(int(gb))
-    if bit_width:
-        return "%s %s (%s GB)" % (capacity, bit_width, gb_str)
-    return "%s (%s GB)" % (capacity, gb_str)
+    return "%sGB" % gb_str
 
 
 # ---------------- 细条滚动条（详情区） ----------------
@@ -1095,13 +1128,14 @@ class App(tk.Tk):
             ("model", 200, "w"),
             ("manufacturer", 110, "w"),
             ("capacity", 130, "center"),
+            ("capacity_gb", 50, "center"),
             ("type", 80, "center"),
         ]:
             lbl = tk.Label(
                 self.header_frame,
                 text={
                     "part_number": "料号", "model": "型号", "manufacturer": "厂商",
-                    "capacity": "容量", "type": "类型",
+                    "capacity": "容量", "capacity_gb": "GB值", "type": "类型",
                 }[c],
                 bg=COLOR_PANEL,
                 fg=COLOR_TEXT_DIM,
@@ -1133,6 +1167,7 @@ class App(tk.Tk):
             ("model", 200, "w"),
             ("manufacturer", 110, "w"),
             ("capacity", 130, "center"),
+            ("capacity_gb", 50, "center"),
             ("type", 80, "center"),
         ]:
             self.tree.column(c, width=w, anchor=anchor)
@@ -1145,7 +1180,7 @@ class App(tk.Tk):
         self._sync_header_labels()
         self.tree.bind("<<TreeviewSelect>>", self._on_candidate_select)
         self.tree.bind("<Double-1>", self._on_candidate_activate)
-        # 宽度自适应：五列始终铺满当前左栏可视宽度（不裁剪也不留白）
+        # 宽度自适应：六列始终铺满当前左栏可视宽度（不裁剪也不留白）
         self.tree.bind("<Configure>", lambda e: self._fit_tree_columns(e.width))
         # 鼠标拖拽改列宽：悬停表头分隔线显双箭头光标，按下拖动联动相邻列
         self.tree.bind("<Motion>", self._on_tree_motion)
@@ -1861,18 +1896,19 @@ class App(tk.Tk):
                     rec.get("model", ""),
                     rec.get("manufacturer", ""),
                     _capacity_display(rec.get("capacity", ""), rec.get("bit_width", "")),
+                    _capacity_gb(rec.get("capacity", "")),
                     rec.get("type", ""),
                 ),
             )
 
     # ---------------- 布局自适应 ----------------
 
-    # 候选表五列（顺序/语义固定）
-    _TREE_COLS = ("part_number", "model", "manufacturer", "capacity", "type")
+    # 候选表六列（顺序/语义固定）
+    _TREE_COLS = ("part_number", "model", "manufacturer", "capacity", "capacity_gb", "type")
     # 左栏右缘与分隔条之间的留白（grid padx 逻辑值；__init__ 里按 DPI 缩放为
     # 实例属性，_apply_pane_width 需一并计入列宽）
     _LEFT_PADX = 7
-    # 候选表五列宽度策略（逻辑像素，使用时经 _col_metrics 按 DPI 缩放）。
+    # 候选表六列宽度策略（逻辑像素，使用时经 _col_metrics 按 DPI 缩放）。
     # 三档语义，解决「窄左栏下料号列被挤到只剩 2 字符」的核心问题：
     #   PREFERRED 常规最小宽：接近完整内容的最小宽度，空间富余时从此起步；
     #   FLOOR     硬底线：极限可辨宽（低于此内容完全不可读），缺口分配的起点；
@@ -1881,20 +1917,20 @@ class App(tk.Tk):
     #             型号与料号高度重复（本数据集两者字符串基本一致），最先被压缩。
     _TREE_COL_PREFERRED = {
         "part_number": 128, "model": 96, "manufacturer": 62,
-        "capacity": 102, "type": 40,
+        "capacity": 102, "capacity_gb": 50, "type": 40,
     }
     _TREE_COL_FLOOR = {
         "part_number": 88, "model": 32, "manufacturer": 46,
-        "capacity": 72, "type": 30,
+        "capacity": 72, "capacity_gb": 40, "type": 30,
     }
     _TREE_COL_DEFICIT_W = {
-        "part_number": 0.46, "capacity": 0.20, "manufacturer": 0.15,
-        "model": 0.11, "type": 0.08,
+        "part_number": 0.40, "capacity": 0.18, "manufacturer": 0.14,
+        "model": 0.10, "capacity_gb": 0.10, "type": 0.08,
     }
     # 常规分支的加宽权重（超出 PREFERRED 的富余按此分配）
     _TREE_COL_WEIGHT = {
-        "part_number": 0.35, "model": 0.30, "manufacturer": 0.20,
-        "capacity": 0.10, "type": 0.05,
+        "part_number": 0.30, "model": 0.25, "manufacturer": 0.18,
+        "capacity": 0.12, "capacity_gb": 0.08, "type": 0.07,
     }
 
     def _col_metrics(self):
@@ -2934,17 +2970,31 @@ class App(tk.Tk):
         # 主信息卡
         head = ttk.Frame(self.detail_inner, style="Card.TFrame", padding=CARD_PADDING)
         head.pack(fill=tk.X, pady=(0, 10))
-        ttk.Label(
-            head,
-            text=record.get("part_number", "") or "(无料号)",
-            style="Big.TLabel",
-        ).pack(anchor="w")
-        ttk.Label(
-            head,
-            text=record.get("model", "") or "",
-            style="Card.TLabel",
-            font=("Consolas", 12),
-        ).pack(anchor="w", pady=(2, 0))
+        # 料号（使用 Text 控件支持复制）
+        pn_text = tk.Text(
+            head, height=1, wrap="word",
+            font=(FONT_FAMILY_UI, FONT_SIZE_XXL, "bold"),
+            bg=COLOR_CARD, fg=COLOR_TEXT,
+            relief="flat", bd=0, highlightthickness=0,
+            padx=0, pady=0, spacing1=0, spacing3=0,
+        )
+        pn_text.insert("1.0", record.get("part_number", "") or "(无料号)")
+        pn_text.configure(state="disabled")
+        pn_text.pack(anchor="w")
+        # 型号（使用 Text 控件支持复制）
+        model_val = record.get("model", "") or ""
+        if model_val:
+            model_text = tk.Text(
+                head, height=1, wrap="word",
+                font=(FONT_FAMILY_MONO, FONT_SIZE_MD),
+                bg=COLOR_CARD, fg=COLOR_TEXT,
+                relief="flat", bd=0, highlightthickness=0,
+                padx=0, pady=0, spacing1=0, spacing3=0,
+            )
+            model_text.insert("1.0", model_val)
+            model_text.configure(state="disabled")
+            model_text.pack(anchor="w", pady=(2, 0))
+        # 标签行（使用 Text 控件支持复制）
         tag_text = " ".join(
             f"[{v}]" for v in [
                 record.get("manufacturer", ""),
@@ -2953,7 +3003,16 @@ class App(tk.Tk):
             ] if v
         )
         if tag_text:
-            ttk.Label(head, text=tag_text, style="Dim.TLabel").pack(anchor="w", pady=(6, 0))
+            tag_widget = tk.Text(
+                head, height=1, wrap="word",
+                font=(FONT_FAMILY_UI, FONT_SIZE_SM),
+                bg=COLOR_CARD, fg=COLOR_TEXT_DIM,
+                relief="flat", bd=0, highlightthickness=0,
+                padx=0, pady=0, spacing1=0, spacing3=0,
+            )
+            tag_widget.insert("1.0", tag_text)
+            tag_widget.configure(state="disabled")
+            tag_widget.pack(anchor="w", pady=(6, 0))
 
         # 分组卡片（#17：字段标签主中文，英文全称悬停可见——双语并排每行
         # 占 ~80px 宽度且对中文用户是噪音，字段值获得更多显示空间）
@@ -2966,6 +3025,8 @@ class App(tk.Tk):
             ("存储参数", [
                 ("容量", "Capacity",
                  _capacity_display(record.get("capacity", ""), record.get("bit_width", ""))),
+                ("GB值", "GB Value",
+                 _capacity_gb(record.get("capacity", ""))),
                 ("位宽", "Bit Width", record.get("bit_width", "")),
                 ("速度", "Speed", record.get("speed", "")),
                 ("电压", "Voltage", record.get("voltage", "")),
