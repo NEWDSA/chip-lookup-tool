@@ -1,16 +1,32 @@
 # ChipLookup 依赖 Python 标准库（tkinter, csv, json, difflib）+ openpyxl
 # 下面几项为可选 / 调试用：
 #   pillow：仅 src/ui.py 的 --screenshot 截图调试功能需要
-#   pyinstaller：打包成单文件 exe 用，可选
+#   pyinstaller：打包 exe 用，可选
 
 # xlsx 读写（数据库默认格式）
 openpyxl>=3.1.0
 
-# 调试截图功能
+# 调试截图功能（也是白板的图像转换依赖）
 pillow>=10.0.0
 
+# ---------------------------------------------------------------------------
 # 手写数学公式识别（白板功能）
-pix2tex[gui]>=0.1.4
+# ---------------------------------------------------------------------------
+# 模型：TrOCR（ViT 编码器 + TrOCR 解码器），在 Google MathWriting 手写数学
+# 数据集上微调。权重不随 pip 分发，用下面的脚本固化到项目里：
+#
+#     python tools/fetch_models.py
+#
+# 选型对比（10 组鼠标手写样本，见 tools/bench_handwriting_models.py）：
+#     pix2tex                  语义正确 0/10   —— 只认印刷体，手写不可用
+#     tjoab/latex_finetuned    语义正确 7/10   ← 采用
+#     fhswf/TrOCR_Math_...     语义正确 8/10   —— 2.3GB，慢 2.3 倍
+torch>=2.2
+transformers>=4.44
+safetensors
+huggingface_hub        # 仅 tools/fetch_models.py 下载权重时用
+
+# LaTeX 解析与符号计算（sympy 的 latex 解析依赖 antlr4 运行时）
 sympy>=1.12
 
 # 打 exe 用（按需安装）

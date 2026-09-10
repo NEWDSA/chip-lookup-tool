@@ -1071,10 +1071,11 @@ class App(tk.Tk):
 
         btn_recognize = ttk.Button(
             math_btn_row, text="识别公式", style="Accent.TButton",
-            command=self.math_canvas.recognize_async,
+            command=self._start_recognize,
         )
         btn_recognize.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
         ToolTip(btn_recognize, "识别手写板中的数学公式并计算结果")
+        self.btn_recognize = btn_recognize
 
         btn_clear_canvas = ttk.Button(
             math_btn_row, text="清空画布", style="Ghost.TButton",
@@ -1727,8 +1728,30 @@ class App(tk.Tk):
         self._cancel_pending_query()
         self._run_query()
 
+    def _start_recognize(self) -> None:
+        """「识别公式」入口：先给按钮加识别中状态，再交给识别器。
+
+        pix2tex 首次调用要加载 ~100MB 权重（实测约 70 秒），旧实现直接把
+        recognize_async 挂到按钮上，用户点完到出结果之间界面毫无反应，
+        极易被当成卡死而反复点击。这里用按钮文案 + 禁用态给出明确反馈，
+        由 _on_math_result / _on_math_error 统一复位。
+        """
+        if getattr(self.math_canvas, "_is_recognizing", False):
+            return  # 已在识别中，避免按钮被永久置灰
+        self.btn_recognize.configure(text="识别中…", state="disabled")
+        self._toast("正在识别手写公式…")
+        self.update_idletasks()
+        self.math_canvas.recognize_async()
+
+    def _reset_recognize_button(self) -> None:
+        try:
+            self.btn_recognize.configure(text="识别公式", state="normal")
+        except tk.TclError:
+            pass
+
     def _on_math_result(self, latex_str: str, result: dict) -> None:
         """手写公式识别成功回调"""
+        self._reset_recognize_button()
         self._clear_detail()
 
         card = ttk.Frame(self.detail_inner, style="Card.TFrame", padding=CARD_PADDING)
@@ -1772,6 +1795,7 @@ class App(tk.Tk):
 
     def _on_math_error(self, error_msg: str) -> None:
         """手写公式识别失败回调"""
+        self._reset_recognize_button()
         self._toast("识别失败：%s" % error_msg, error=True)
 
     def _on_arrow_up(self, event=None):

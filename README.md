@@ -1,9 +1,13 @@
 ChipLookup
 ============
 
-跨平台轻量芯片料号查询器，深色卡片风格 GUI，UI 参考 https://fm.itxtech.org/zh/parts/D8DKS 。
-Python 3 + Tkinter，运行时仅依赖标准库，单 exe 仅 ~16 MB，无需额外环境即可部署。
+跨平台芯片料号查询器，深色卡片风格 GUI，UI 参考 https://fm.itxtech.org/zh/parts/D8DKS 。
+Python 3 + Tkinter，核心查询运行时仅依赖标准库；另附手写数学公式白板（TrOCR 离线识别）。
 数据库采用 CSV 文件，可手工维护、可批量导入/导出，无需改动代码。
+
+打包体积两种形态：
+- **含白板**：onedir 目录约 2.1 GB（torch + transformers + 1.3 GB 模型权重），启动仍 1-2 秒
+- **不含白板**：单文件 exe 约 17 MB（`CHIPLOOKUP_NO_WHITEBOARD=1` 构建）
 
 特性
 ----
@@ -23,18 +27,23 @@ Python 3 + Tkinter，运行时仅依赖标准库，单 exe 仅 ~16 MB，无需�
     补全 model / 厂商，全程纯 Python 标准库，无需安装 Node.js 即可运行。
 11. 三种数据加载模式：本地 CSV / 上游索引 / 混合（合并+去重），
     启动参数或 chiplookup.json 配置即可切换，UI 顶部也可随时热切换。
+12. 手写数学公式白板：左栏手写算式 → 「识别公式」→ 出 LaTeX 与计算结果。
+    模型用 TrOCR（Google MathWriting 手写数学数据集微调），全离线推理。
 
 目录结构
 --------
 chip-lookup-tool/
 ├── README.md                      本文件
-├── requirements.txt               （实际只用到标准库，列给 IDE 用于类型补全）
-├── ChipLookup.spec                PyInstaller 配置，附带 Win7 打包注释
+├── requirements.txt               运行依赖（openpyxl / pillow / torch / transformers / sympy）
+├── ChipLookup.spec                PyInstaller 配置（默认 onedir，含白板；附 Win7 打包注释）
 ├── data/
 │   └── chip_database.csv          默认数据库（含 D8DKS 等 30+ 条真实料号）
+├── models/
+│   └── trocr-math/                白板模型权重（~1.3GB，git 忽略，用 tools/fetch_models.py 拉取）
 ├── src/
 │   ├── main.py                    入口（解析参数/配置 → 构建数据源 → 启动 UI 或 stats）
 │   ├── ui.py                      Tkinter 界面（含顶部数据源模式热切换）
+│   ├── math_canvas.py             手写板 + TrOCR 识别 + sympy 计算
 │   ├── database.py                CSV 数据层（编码探测/校验/加载/增删改/导入导出）
 │   ├── config.py                  模式常量、Settings、chiplookup.json 读写、CLI 参数
 │   ├── sources.py                 三种数据源本地/上游/混合 + 合并去重
@@ -44,13 +53,16 @@ chip-lookup-tool/
 │   └── synthetic_card.py          数据驱动的完整卡片 PNG 渲染（截图/分享用）
 ├── tests/
 │   ├── test_modes.py              三模式/异常/配置/CLI 冒烟测试（全离线）
+│   ├── test_whiteboard.py         白板识别测试（计算层/画布层/集成层/精度层/UI 层）
 │   └── fixtures/                  测试用本地 CSV 与上游索引缓存
 ├── tools/
 │   ├── import_export.py           命令行工具：开 UI 也能维护数据
 │   ├── sync_upstream.py           上游数据同步器（纯 Python，无 Node 依赖）
+│   ├── fetch_models.py            下载并固化白板模型权重到 models/
+│   ├── bench_handwriting_models.py 手写识别模型选型评测（pix2tex vs TrOCR）
 │   └── test_sync_no_node.py       无 Node 端到端自检（只依赖标准库）
 ├── build/                         PyInstaller 中间产物
-├── dist/                          打包产物：ChipLookup.exe（单文件）
+├── dist/                          打包产物：dist/ChipLookup/（onedir，含白板）
 └── screenshots/                   界面截图与合成卡片示例
     ├── ui_exact_D8DKS.png         实际 UI：精确查询 D8DKS（屏幕可视区域）
     ├── ui_fuzzy_D8DK.png          实际 UI：模糊搜索 D8DK
@@ -62,10 +74,11 @@ chip-lookup-tool/
 
 快速使用（推荐：Windows 用户直接用 exe）
 ----------------------------------------
-1. 进入 dist/ 目录
+1. 进入 dist/ChipLookup/ 目录
 2. 双击 ChipLookup.exe
-3. 首次运行会在 exe 旁边生成 data/chip_database.csv（从 exe 内嵌的种子拷贝）
+3. 首次运行会在 exe 旁边生成 data/chip_database.csv（从包内嵌的种子拷贝）
 4. 在「查询输入」框输入 D8DKS → 立刻显示 Micron DDR5 16Gb x8 的完整卡片
+5. 想试白板：在左栏「手写数学公式」区用鼠标写个 `2+3` → 点「识别公式」
 
 源数据保留在 exe 旁边的 data/chip_database.csv 中，可手工用 Excel/Numbers 编辑。
 所有「导入 / 导出 / 增 / 删 / 改」都会写到这里。
@@ -232,10 +245,50 @@ $ python src/main.py
 - Python 3.8+（推荐 3.10 以上）
 - Tkinter（标准库）：Windows/macOS 默认安装；Linux 发行版可能需 `apt install python3-tk`
 
-打包成单文件 exe
------------------
-当前 dist/ChipLookup.exe 是用 Python 3.11 + PyInstaller 6.x 打出的，
+打包成 exe（含白板，默认 onedir）
+---------------------------------
+当前 dist/ChipLookup/ 是用 Python 3.11 + PyInstaller 6.x 打出的，
 适用于 Windows 10+ / 11 / Server 2016+。
+
+```bash
+# 1) 固化白板模型权重（约 1.3GB，只做一次）
+python tools/fetch_models.py
+
+# 2) 打包（产出 dist/ChipLookup/ 目录）
+python -m PyInstaller ChipLookup.spec --noconfirm --workpath build_wb
+
+# 3) 用 Inno Setup 编译 installer/setup.iss → dist_installer/ChipLookup_Setup_x.y.z.exe
+```
+
+**为什么是 onedir 而不是单文件**：白板识别依赖 torch + transformers + 1.3GB
+模型权重，整包约 2GB。onefile 每次启动都要把 2GB 解压到临时目录，冷启动要
+几十秒、还要占等量磁盘，不可接受。onedir 不落地解压，启动即读。
+
+启动速度不受体积影响的另一个前提：`src/math_canvas.py` 只在 `_get_model()`
+里 import torch/transformers（延迟加载），进程启动阶段不碰它们。因此 exe 启动
+仍是 1-2 秒，白板首次点击才付出模型加载成本。
+
+打包开关（环境变量）：
+- `CHIPLOOKUP_ONEFILE=1`  —— 改用单文件模式（体积大时启动很慢，不建议）
+- `CHIPLOOKUP_NO_WHITEBOARD=1` —— 打一个不含白板的轻量包（~17MB）
+
+**打包后自检**（重要）
+----------------------
+exe 是 windowed 程序没有控制台，白板又只在点击时才加载模型，出问题很难发现。
+用自检入口一次性验证 torch / transformers / 模型权重 / sympy 四条链路：
+
+```bash
+dist\ChipLookup\ChipLookup.exe --selftest-whiteboard
+# 结果同时写到 exe 旁边的 whiteboard_selftest.log
+```
+
+期望输出：
+```
+[selftest] 模型目录：...\_internal\models\trocr-math
+[selftest] 识别结果：'4\\times4'
+[selftest] 计算结果：16
+[selftest] OK：白板识别链路在打包环境下可用
+```
 
 如需 Windows 7 兼容版本（重点！）
 ---------------------------------
@@ -278,17 +331,57 @@ Python 官方从 3.9 开始放弃对 Windows 7 的支持（Python 3.8 是最后�
 - 大量导入：在 Excel 里编辑 csv → 另存为 UTF-8 → 「导入 CSV」。
 - 备份：UI 「导出 CSV」一键全量备份。
 
+手写数学公式白板
+----------------
+左栏「手写数学公式」区：用鼠标写下算式 → 点「识别公式」→ 右侧卡片给出
+LaTeX 与计算结果。全离线，不联网。
+
+**模型选型**（实测见 `tools/bench_handwriting_models.py`，10 组鼠标手写样本，
+按「数值是否算对」计分）
+
+| 模型 | 语义正确 | 单次耗时 | 体积 | 结论 |
+|------|---------|---------|------|------|
+| pix2tex | 0/10 | 0.5s | 0.12GB | ✗ 只认印刷体 LaTeX 排版公式，手写等于不可用 |
+| **tjoab/latex_finetuned** | **7/10** | **2.7s** | **1.3GB** | ✓ 采用（TrOCR-base，原生输出 LaTeX） |
+| fhswf/TrOCR_Math_handwritten | 8/10 | 6.3s | 2.3GB | 更准但体积翻倍、慢 2.3 倍 |
+
+TrOCR 系模型在 Google MathWriting 手写数学数据集上微调，才是对手写对症的选型。
+换模型只改 `src/math_canvas.py` 里的 `MODEL_SUBDIR` / `MODEL_ID` 两个常量。
+
+**已知局限**：手写「x」有时被认成字母 X（已用规则在数字之间自动还原为乘号）；
+多位数字偶有截断（如 `5+5=10` 认成 `5+5=1`）；识别不准时会明确报错而不是
+给出一个看起来像结果的噪声符号。
+
+**首次点击较慢**：模型加载约 10-25 秒（1.3GB 权重读盘 + torch 初始化），
+加载期间按钮显示「识别中…」并禁用。之后每次识别约 2-3 秒。
+
+**源码模式跑测试**：
+```bash
+python tests/test_whiteboard.py            # 38 项：计算/画布/集成/整理/定位/UI
+WB_SLOW=1 python tests/test_whiteboard.py  # 追加真实模型端到端识别
+```
+
 性能/资源
 ---------
-- 启动时间：1-2 秒（单文件 exe，首次会解压到临时目录）
-- 内存占用：~50-90 MB（PyInstaller 单文件 + Python 运行时）
+- 启动时间：1-2 秒（onedir，不落地解压；torch 延迟到点「识别公式」才加载）
+- 内存占用：~50-90 MB（不含白板）；白板首次加载模型后 +~1.5 GB
 - CPU 占用：低（搜索为线性扫描 O(N)，按字符串长度 N；1 万条料号下毫秒级响应）
+- 磁盘占用：整包约 2.1 GB（其中模型权重 1.3 GB、torch 约 360 MB）
 
 常见问题
 --------
 Q：双击 exe 后窗口闪一下就没了？
 A：检查是否被安全软件拦截了 _MEIPASS 临时目录，或尝试命令行启动看错误：
-   dist/ChipLookup.exe  （直接运行如有控制台会打印错误；若 console=False 时则在事件查看器）
+   dist/ChipLookup/ChipLookup.exe  （直接运行如有控制台会打印错误；若 console=False 时则在事件查看器）
+
+Q：白板点了「识别公式」没反应？
+A：先跑 `ChipLookup.exe --selftest-whiteboard` 看 whiteboard_selftest.log。
+   若是 ModuleNotFoundError，说明打包时漏了 hiddenimports（见 ChipLookup.spec）；
+   若是模型目录不对，确认 `_internal\models\trocr-math\model.safetensors` 存在。
+
+Q：识别结果不对怎么办？
+A：当前模型对手写输入的准确率约 7/10，属于已知水平。写得大一些、笔画清晰些
+   会明显更准；数字之间用「x」表示乘法比用「×」更容易被认对。
 
 Q：导入 CSV 时报编码错误？
 A：用 UTF-8 (with BOM) 或 UTF-8 (no BOM) 保存。Windows Excel 另存为 CSV UTF-8 即可。

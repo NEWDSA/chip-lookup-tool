@@ -65,7 +65,93 @@ def _parse_args():
         choices=["paginate", "load_more"],
         help="截图前设置分页模式",
     )
+    parser.add_argument(
+        "--selftest-whiteboard",
+        action="store_true",
+        help="白板自检：合成一张手写算式图，跑完整识别链路并打印结果后退出"
+             "（用于验证打包后 torch/transformers/模型权重是否可用）",
+    )
+    parser.add_argument(
+        "--selftest-log",
+        help="自检日志输出路径；不指定则写到 exe 旁边的 whiteboard_selftest.log",
+    )
     return parser.parse_args()
+
+
+def _selftest_whiteboard(log_path: str | None) -> int:
+    """白板端到端自检：不依赖 Tk，直接构造图像走识别 + 计算。
+
+    这是打包后的关键验证手段：exe 是 windowed（无控制台），白板又只在用户
+    点击时才加载模型，出问题很难被发现。用它可以在命令行上一次性确认
+    torch / transformers / 模型权重 / sympy 四条链路都通。
+
+    注意 windowed exe 里 sys.stdout 是 None，print 会静默丢弃，所以结果
+    必须同时落盘。
+    """
+    from paths import program_root
+
+    lines: list[str] = []
+
+    def say(msg: str) -> None:
+        lines.append(msg)
+        print(msg)
+
+    if not log_path:
+        log_path = os.path.join(program_root(), "whiteboard_selftest.log")
+
+    code = 1
+    try:
+        try:
+            from PIL import Image, ImageDraw
+        except ImportError as exc:
+            say("[selftest] 缺少 pillow：%s" % exc)
+            raise SystemExit
+
+        from math_canvas import MathRecognizer
+
+        # 合成 "4x4" 的折线笔迹（与 tests/test_whiteboard.py 的样本一致）
+        img = Image.new("RGB", (380, 150), "white")
+        d = ImageDraw.Draw(img)
+
+        def four(x0):
+            d.line([x0 + 30, 32, x0 + 8, 68], fill="black", width=3)
+            d.line([x0 + 8, 68, x0 + 46, 68], fill="black", width=3)
+            d.line([x0 + 30, 32, x0 + 30, 90], fill="black", width=3)
+
+        four(20)
+        d.line([70, 32, 100, 82], fill="black", width=3)
+        d.line([100, 32, 70, 82], fill="black", width=3)
+        four(120)
+
+        rec = MathRecognizer()
+        say("[selftest] 模型目录：%s" % rec._resolve_model_dir())
+        latex = rec.recognize(img)
+        say("[selftest] 识别结果：%r" % latex)
+
+        result = rec.calculate(latex)
+        if "error" in result:
+            say("[selftest] 计算失败：%s" % result["error"])
+        else:
+            say("[selftest] 计算结果：%s" % result["result"])
+            if result["result"] == "16":
+                say("[selftest] OK：白板识别链路在打包环境下可用")
+                code = 0
+            else:
+                say("[selftest] 结果不是 16，白板链路异常")
+    except SystemExit:
+        pass
+    except Exception as exc:
+        import traceback
+        say("[selftest] 异常：%s" % exc)
+        say(traceback.format_exc())
+    finally:
+        try:
+            with open(log_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+            print("[selftest] 日志已写入 %s" % log_path)
+        except OSError:
+            pass
+    return code
 
 
 def _enable_dpi_awareness():
@@ -91,6 +177,11 @@ def _enable_dpi_awareness():
 def main() -> int:
     _enable_dpi_awareness()
     args = _parse_args()
+
+    # 白板自检：不碰数据源，尽早返回
+    if args.selftest_whiteboard:
+        return _selftest_whiteboard(args.selftest_log)
+
     settings = build_settings(args)
 
     for w in settings.warnings:

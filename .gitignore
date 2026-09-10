@@ -27,3 +27,7 @@ build
 dist_installer
 dist
 .workbuddy
+
+# 白板模型权重（约 1.3 GB，不进 git）
+# 构建前用 python tools/fetch_models.py 拉到本地
+models/
